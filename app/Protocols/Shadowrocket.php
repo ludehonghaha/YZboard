@@ -18,6 +18,7 @@ class Shadowrocket extends AbstractProtocol
         Server::TYPE_TUIC,
         Server::TYPE_ANYTLS,
         Server::TYPE_SOCKS,
+        Server::TYPE_MIERU,
     ];
 
     protected $protocolRequirements = [
@@ -65,6 +66,9 @@ class Shadowrocket extends AbstractProtocol
             }
             if ($item['type'] === Server::TYPE_SOCKS) {
                 $uri .= self::buildSocks($item['password'], $item);
+            }
+            if ($item['type'] === Server::TYPE_MIERU) {
+                $uri .= self::buildMieru($item['password'], $item);
             }
         }
         return response(base64_encode($uri))
@@ -446,6 +450,39 @@ class Shadowrocket extends AbstractProtocol
         $uri = "anytls://{$password}@{$addr}:{$server['port']}?{$query}#{$name}";
         $uri .= "\r\n";
         return $uri;
+    }
+
+    /**
+     * Shadowrocket supports the official Mieru simple share link (mierus://).
+     * Do not use a made-up mieru:// URI containing plain credentials: mieru://
+     * carries a binary protobuf config, whereas mierus:// is human-readable.
+     *
+     * Each port binding is accompanied by exactly one transport binding.
+     */
+    public static function buildMieru($password, $server): string
+    {
+        $settings = data_get($server, 'protocol_settings', []);
+        $host = Helper::wrapIPv6($server['host']);
+        $name = rawurlencode($server['name']);
+        $identity = rawurlencode((string) $password);
+        $transport = strtoupper((string) data_get($settings, 'transport', 'TCP'));
+        $ports = (string) (data_get($server, 'ports') ?: $server['port']);
+
+        $query = 'profile=default';
+        foreach (explode(',', $ports) as $port) {
+            $port = trim($port);
+            if ($port === '' || !preg_match('/^\\d{1,5}(?:-\\d{1,5})?$/', $port)) {
+                continue;
+            }
+            $query .= '&port=' . rawurlencode($port);
+            $query .= '&protocol=' . rawurlencode($transport);
+        }
+
+        if ($pattern = data_get($settings, 'traffic_pattern')) {
+            $query .= '&traffic-pattern=' . rawurlencode($pattern);
+        }
+
+        return "mierus://{$identity}:{$identity}@{$host}?{$query}#{$name}\\r\\n";
     }
 
     public static function buildSocks($password, $server)
