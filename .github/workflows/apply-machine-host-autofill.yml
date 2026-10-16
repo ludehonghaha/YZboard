@@ -1,0 +1,38 @@
+name: Apply node machine IP autofill
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - scripts/patch-machine-host-autofill.py
+      - .github/workflows/apply-machine-host-autofill.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-admin-bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Patch pinned admin bundle
+        run: python3 scripts/patch-machine-host-autofill.py
+      - name: Verify exact compiled changes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('public/assets/admin/assets/admin-e0cnfxM9.js').read_text()
+          assert 'De?.agent_runtime?.public_ipv4' in s
+          assert 'T.setValue("host",Ie,{shouldDirty:!0,shouldValidate:!0})' in s
+          assert 'T.setValue("host",Be,{shouldValidate:!0})' in s
+          PY
+      - name: Commit generated admin bundle
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public/assets/admin/assets/admin-e0cnfxM9.js
+          if ! git diff --cached --quiet; then
+            git commit -m "build(admin): autofill host from bound machine public address"
+            git push origin HEAD:main
+          fi
