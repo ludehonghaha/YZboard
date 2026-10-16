@@ -51,6 +51,31 @@ class UpstreamSubscriptionTest extends TestCase
         $this->assertSame('10', $params['keepalive']);
     }
 
+    public function test_shadowrocket_mieru_share_link_is_line_delimited_and_standard(): void
+    {
+        $uri = Shadowrocket::buildMieru('user-secret', [
+            'name' => '沪港',
+            'host' => '192.0.2.10',
+            'port' => 4902,
+            'protocol_settings' => ['transport' => 'TCP', 'traffic_pattern' => null],
+        ]);
+
+        $this->assertStringStartsWith('mierus://', $uri);
+        $this->assertStringEndsWith("\r\n", $uri);
+        $this->assertStringNotContainsString('\\r\\n', $uri);
+
+        $url = parse_url(trim($uri));
+        $this->assertSame('mierus', $url['scheme']);
+        $this->assertSame('user-secret', $url['user']);
+        $this->assertSame('user-secret', $url['pass']);
+        $this->assertSame('192.0.2.10', $url['host']);
+        $this->assertSame('沪港', rawurldecode($url['fragment']));
+        parse_str($url['query'], $params);
+        $this->assertSame('default', $params['profile']);
+        $this->assertSame('4902', $params['port']);
+        $this->assertSame('TCP', $params['protocol']);
+    }
+
     public static function hysteriaBandwidths(): array
     {
         return [
