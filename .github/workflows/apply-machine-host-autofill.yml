@@ -1,9 +1,10 @@
-name: Apply node machine IP autofill
+name: Apply node machine IP and port autofill
 on:
   workflow_dispatch:
   push:
     paths:
       - scripts/patch-machine-host-autofill.py
+      - scripts/patch-machine-port-autofill.py
       - .github/workflows/apply-machine-host-autofill.yml
 
 permissions:
@@ -17,7 +18,9 @@ jobs:
         with:
           persist-credentials: true
       - name: Patch pinned admin bundle
-        run: python3 scripts/patch-machine-host-autofill.py
+        run: |
+          python3 scripts/patch-machine-host-autofill.py
+          python3 scripts/patch-machine-port-autofill.py
       - name: Verify exact compiled changes
         run: |
           python3 - <<'PY'
@@ -26,6 +29,8 @@ jobs:
           assert 'De?.agent_runtime?.public_ipv4' in s
           assert 'T.setValue("host",Ie,{shouldDirty:!0,shouldValidate:!0})' in s
           assert 'T.setValue("host",Be,{shouldValidate:!0})' in s
+          assert 'server/manage/recommendPort' in s
+          assert 'T.setValue("server_port",Ne,{shouldDirty:!0,shouldValidate:!0})' in s
           PY
       - name: Validate JavaScript syntax
         run: node --check public/assets/admin/assets/admin-e0cnfxM9.js
@@ -35,6 +40,6 @@ jobs:
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add public/assets/admin/assets/admin-e0cnfxM9.js
           if ! git diff --cached --quiet; then
-            git commit -m "build(admin): autofill host from bound machine public address"
+            git commit -m "build(admin): autofill host and suggested port from bound machine"
             git push origin HEAD:main
           fi
