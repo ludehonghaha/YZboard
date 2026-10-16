@@ -159,6 +159,11 @@ ALIDNS_ACCESS_KEY_ID=xxxx`,value:i,onChange:m=>{const _=m.target.value;r(_),p.on
  * This is a React component integrated into the existing Route Management page.
  * All writes use the existing protected admin API and do not touch route groups.
  */
+/*
+ * Generalized inbound -> ordered rules -> multiple proxy landings.
+ * This is a React component integrated into the existing Route Management page.
+ * All writes use the existing protected admin API and do not touch route groups.
+ */
 function yzSmartRelayRoutePanel() {
   const h=C.createElement;
   const AI=[
@@ -180,6 +185,7 @@ function yzSmartRelayRoutePanel() {
   const [entryId,setEntryId]=C.useState("");
   const [enabled,setEnabled]=C.useState(false);
   const [outbounds,setOutbounds]=C.useState([]);
+  const [manualOpen,setManualOpen]=C.useState(false);
   const [rules,setRules]=C.useState([]);
   const [defaultTarget,setDefaultTarget]=C.useState("direct");
   const [message,setMessage]=C.useState("");
@@ -189,8 +195,12 @@ function yzSmartRelayRoutePanel() {
 
   const current=entries.find(x=>String(x.id)===entryId);
   const childTargets=(current?.children||[]).map(x=>({id:"relay-"+x.id,name:x.name+"（现有"+x.type+"落地）"}));
+  const existingTargets=(current?.existing_landings||[]).map(x=>({
+    id:x.tag,
+    name:x.name+" · "+(x.type==="socks"?"SOCKS5":x.type.toUpperCase())+" · "+x.host+":"+x.port
+  }));
   const outboundTargets=outbounds.map(x=>({id:"sr-"+x.id,name:x.name+"（"+x.protocol+"）"}));
-  const targets=[{id:"direct",name:"服务器直连（direct）"},...childTargets,...outboundTargets];
+  const targets=[{id:"direct",name:"服务器直连（direct）"},...existingTargets,...childTargets,...outboundTargets];
   const inputBase="h-9 w-full rounded-md border bg-background px-2 text-sm text-foreground";
   const thinButton="rounded-md border px-3 py-1.5 text-xs hover:bg-accent";
   const blank=(id,protocol)=>({id,name:"新落地",protocol,server:"",port:"",username:"",password:"",uuid:"",method:"aes-128-gcm",sni:"",tls:false,transport:"TCP"});
@@ -221,6 +231,7 @@ function yzSmartRelayRoutePanel() {
     setEntryId(entry?String(entry.id):"");
     setEnabled(!!profile.enabled);
     if(profile.mode==="advanced"){
+      setManualOpen(!!profile.outbounds?.length);
       setOutbounds((profile.outbounds||[]).map(o=>({
         id:o.id,name:o.name,protocol:o.protocol,server:o.server,
         port:String(o.port||""),username:o.settings?.username||"",
@@ -234,6 +245,7 @@ function yzSmartRelayRoutePanel() {
       })));
       setDefaultTarget(profile.default_target||"direct");
     }else{
+      setManualOpen(false);
       setOutbounds([]);
       const hasLegacy=Array.isArray(profile.domains)&&profile.domains.length>0;
       setRules(hasLegacy?[{
@@ -311,7 +323,7 @@ function yzSmartRelayRoutePanel() {
   return h("section",{className:"mb-4 rounded-lg border bg-card p-4 shadow-sm","data-yz-route-smart-relay":"true"},
     h("div",{className:"flex flex-wrap items-center justify-between gap-3"},
       h("div",null,h("h3",{className:"text-sm font-semibold"},"链式分流 · 多落地路由"),
-        h("p",{className:"mt-1 text-xs text-muted-foreground"},"选择入口协议、创建多个落地、按域名/IP 设置规则；未命中时使用默认出口。")),
+        h("p",{className:"mt-1 text-xs text-muted-foreground"},"直接选择节点管理里已有的入口和落地；按域名/IP 设置规则，其他流量走默认出口。")),
       h("button",{type:"button",className:thinButton,onClick:()=>setOpen(!open)},open?"收起设置":"配置链式分流")
     ),
     open&&h("div",{className:"mt-4 space-y-4 border-t pt-4"},
@@ -330,12 +342,31 @@ function yzSmartRelayRoutePanel() {
         h("input",{type:"checkbox",checked:enabled,onChange:e=>setEnabled(e.target.checked)}),
         "启用此入口的链式分流"),
       h("div",{className:"rounded-lg border p-3"},
-        h("div",{className:"mb-2 flex items-center justify-between gap-2"},
-          h("div",null,h("h4",{className:"text-sm font-medium"},"落地出口"),
-            h("p",{className:"text-xs text-muted-foreground"},"已有中转落地自动列出；也可以手动添加其他服务的 IP、端口及协议凭据。")),
-          h("button",{type:"button",className:thinButton,onClick:()=>setOutbounds(old=>[...old,blank(newId(),"socks")])},"+ 添加落地")
+        h("div",{className:"mb-2 flex flex-wrap items-center justify-between gap-2"},
+          h("div",null,h("h4",{className:"text-sm font-medium"},"从已有节点选择落地"),
+            h("p",{className:"text-xs text-muted-foreground"},
+              "无需新建节点。下方默认出口和分流规则直接选择现有节点，系统自动读取协议、IP、端口和认证。"))
         ),
-        ...outbounds.map(o=>h("div",{key:o.id,className:"mt-3 rounded-md border bg-muted/10 p-3"},
+        existingTargets.length
+          ?h("div",{className:"grid grid-cols-1 gap-2 md:grid-cols-2"},
+            ...existingTargets.map(x=>h("div",{key:x.id,className:"rounded-md border bg-muted/10 px-3 py-2 text-xs"},x.name)))
+          :h("p",{className:"text-xs text-muted-foreground"},
+            "暂无可复用的 SOCKS5 / Mieru 节点；请确认落地节点已启用，并与入口存在共同有效用户。"),
+        h("p",{className:"mt-2 text-xs text-muted-foreground"},
+          "目前直接复用支持 SOCKS5、Mieru。其他现有协议需要专门的握手与认证适配，暂不伪装成可用出口。两端可能分别计量流量。")
+      ),
+      h("div",{className:"rounded-lg border p-3"},
+        h("div",{className:"mb-2 flex items-center justify-between gap-2"},
+          h("div",null,h("h4",{className:"text-sm font-medium"},"手动添加第三方落地（高级）"),
+            h("p",{className:"text-xs text-muted-foreground"},"只有面板里没有该节点时才需要填写 IP、端口和密码。")),
+          h("button",{type:"button",className:thinButton,onClick:()=>{
+            if(!manualOpen)setManualOpen(true);
+            else setManualOpen(false);
+          }},manualOpen?"收起高级设置":"展开高级设置")
+        ),
+        manualOpen&&h("button",{type:"button",className:thinButton,
+          onClick:()=>setOutbounds(old=>[...old,blank(newId(),"socks")])},"+ 添加第三方落地"),
+        ...(manualOpen?outbounds:[]).map(o=>h("div",{key:o.id,className:"mt-3 rounded-md border bg-muted/10 p-3"},
           h("div",{className:"mb-3 flex items-center justify-between gap-2"},
             h("strong",{className:"text-xs"},"自定义落地 "+o.id),
             h("button",{type:"button",className:thinButton,onClick:()=>setOutbounds(old=>old.filter(x=>x.id!==o.id))},"删除")),
@@ -373,8 +404,8 @@ function yzSmartRelayRoutePanel() {
           h("p",{className:"mt-2 text-xs text-muted-foreground"},
             "填写落地服务实际使用的协议和认证信息，仅填 IP 无法自动部署远端代理服务。")
         )),
-        !outbounds.length&&h("p",{className:"text-xs text-muted-foreground"},
-          childTargets.length?"现有中转落地可直接在下方规则中选择。":"暂未新增落地。可以使用服务器直连，或点击添加落地。")
+        manualOpen&&!outbounds.length&&h("p",{className:"mt-2 text-xs text-muted-foreground"},
+          "你可以直接使用上方已有节点；新增第三方落地不是必需步骤。")
       ),
       h("div",{className:"rounded-lg border p-3"},
         h("div",{className:"mb-2 flex flex-wrap items-center gap-2"},
