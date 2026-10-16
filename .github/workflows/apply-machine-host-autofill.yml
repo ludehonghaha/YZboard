@@ -27,6 +27,8 @@ jobs:
           assert 'T.setValue("host",Ie,{shouldDirty:!0,shouldValidate:!0})' in s
           assert 'T.setValue("host",Be,{shouldValidate:!0})' in s
           PY
+      - name: Validate JavaScript syntax
+        run: node --check public/assets/admin/assets/admin-e0cnfxM9.js
       - name: Commit generated admin bundle
         run: |
           git config user.name github-actions[bot]
