@@ -774,7 +774,7 @@ class ServerService
         if (($response['smart_relay']['mode'] ?? null) === 'advanced') {
             $response['custom_outbounds'] = array_merge(
                 $response['custom_outbounds'] ?? [],
-                SmartRoutingService::outboundConfigs($smart)
+                SmartRoutingService::outboundConfigs($smart, $node)
             );
         }
 
