@@ -721,7 +721,7 @@ class ServerService
                 ...$baseConfig,
                 'server_port' => (int) $serverPort,
                 'transport' => data_get($protocolSettings, 'transport', 'TCP'),
-                'traffic_pattern' => $protocolSettings['traffic_pattern'],
+                'traffic_pattern' => (string) data_get($protocolSettings, 'traffic_pattern', ''),
             ],
             'wireguard' => [...$baseConfig, 'server_port' => (int) $serverPort],
             default => [],
