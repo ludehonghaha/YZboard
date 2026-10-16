@@ -730,6 +730,17 @@ class ServerService
         if ($relay = self::buildRelayConfig($node)) {
             $response['relay'] = $relay;
         }
+        // Smart relay is only meaningful on a valid entry with both active child outbounds.
+        // The Node independently validates IDs against the relay children before applying rules.
+        if (($response['relay']['mode'] ?? null) === 'entry'
+            && data_get($node->smart_relay, 'enabled') === true) {
+            $config = $node->smart_relay;
+            $ids = array_column($response['relay']['children'], 'node_id');
+            if (in_array((int) ($config['ai_node_id'] ?? 0), $ids, true)
+                && in_array((int) ($config['default_node_id'] ?? 0), $ids, true)) {
+                $response['smart_relay'] = $config;
+            }
+        }
         if ($nodeType === Server::TYPE_WIREGUARD && !$node->isRelayChild()) {
             $response['wireguard'] = WireGuardService::nodeConfig($node);
         }

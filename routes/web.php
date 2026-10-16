@@ -73,6 +73,14 @@ Route::get('/', function (Request $request) {
     }
 });
 
+// Separate single-purpose admin page; data and writes use the existing
+// Sanctum-protected AdminRoute API (no independent passwords or tokens).
+Route::get('/' . admin_setting('secure_path', admin_setting('frontend_admin_path', hash('crc32b', config('app.key')))) . '/smart-relay', function () {
+    return view('smart-relay', [
+        'secure_path' => admin_setting('secure_path', admin_setting('frontend_admin_path', hash('crc32b', config('app.key')))),
+    ]);
+});
+
 //TODO:: 兼容
 Route::get('/' . admin_setting('secure_path', admin_setting('frontend_admin_path', hash('crc32b', config('app.key')))), function () {
     return view('admin', [

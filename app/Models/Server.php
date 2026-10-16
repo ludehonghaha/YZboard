@@ -146,6 +146,7 @@ class Server extends Model
         'protocol_settings' => 'array',
         'custom_outbounds' => 'array',
         'custom_routes' => 'array',
+        'smart_relay' => 'array',
         'source_policy' => 'array',
         'cert_config' => 'array',
         'last_check_at' => 'integer',

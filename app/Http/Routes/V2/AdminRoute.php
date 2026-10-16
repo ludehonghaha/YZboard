@@ -6,6 +6,7 @@ use App\Http\Controllers\V2\Admin\MailTemplateController;
 use App\Http\Controllers\V2\Admin\PlanController;
 use App\Http\Controllers\V2\Admin\Server\GroupController;
 use App\Http\Controllers\V2\Admin\Server\RouteController;
+use App\Http\Controllers\V2\Admin\Server\SmartRelayController;
 use App\Http\Controllers\V2\Admin\Server\ManageController;
 use App\Http\Controllers\V2\Admin\Server\MachineController;
 use App\Http\Controllers\V2\Admin\OrderController;
@@ -101,6 +102,11 @@ class AdminRoute
                 $router->post('/save', [RouteController::class, 'save']);
                 $router->post('/update', [RouteController::class, 'update']);
                 $router->post('/drop', [RouteController::class, 'drop']);
+            });
+            // Intelligent landing selection (same entry UUID, AI -> A, fallback -> B).
+            $router->group(['prefix' => 'server/smart-relay'], function ($router) {
+                $router->get('/fetch', [SmartRelayController::class, 'fetch']);
+                $router->post('/save', [SmartRelayController::class, 'save']);
             });
             // 节点管理接口
             $router->group([
