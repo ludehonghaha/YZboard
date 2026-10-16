@@ -28,6 +28,7 @@ class SmartRelayController extends Controller
                 'protocol' => $entry->type,
                 'kernel' => Server::effectiveKernelType($entry->kernel_type),
                 'children' => $children,
+                'existing_landings' => SmartRoutingService::reusableLandings($entry),
                 'smart_relay' => $entry->smart_relay,
             ];
         })->values()->all();
