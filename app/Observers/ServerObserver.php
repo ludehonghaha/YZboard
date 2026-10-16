@@ -62,13 +62,40 @@ class ServerObserver
             $this->notifyRelayEntry($server->relay_entry_id);
             $this->notifyRelayEntry($server->getOriginal('relay_entry_id'));
         }
+        if ($server->wasChanged([
+            'host', 'port', 'type', 'protocol_settings', 'enabled',
+            'group_ids', 'machine_id', 'smart_relay', 'relay_entry_id',
+        ])) {
+            $this->notifySmartRouteReferences((int) $server->id);
+        }
     }
 
     public function deleted(Server $server): void
     {
         $this->notifyMachineChange(null, $server->getOriginal('machine_id') ?: $server->machine_id);
         $this->notifyRelayEntry($server->getOriginal('relay_entry_id') ?: $server->relay_entry_id);
+        $this->notifySmartRouteReferences((int) $server->id);
         app(DeviceHandoverService::class)->deletedNode((int) $server->id);
+    }
+
+    /**
+     * An already-created node can be reused as a landing by another entry.
+     * When it changes (IP, port, enabled state or credentials), refresh every
+     * dependent entry. Invalid references compile to block, never direct.
+     */
+    private function notifySmartRouteReferences(int $landingId): void
+    {
+        foreach (Server::query()->whereNotNull('smart_relay')->get(['id', 'smart_relay']) as $entry) {
+            if ((int) $entry->id === $landingId
+                || data_get($entry->smart_relay, 'enabled') !== true
+                || data_get($entry->smart_relay, 'mode') !== 'advanced') {
+                continue;
+            }
+            $ids = array_map('intval', (array) data_get($entry->smart_relay, 'existing_node_ids', []));
+            if (in_array($landingId, $ids, true)) {
+                NodeSyncService::notifyConfigUpdated((int) $entry->id);
+            }
+        }
     }
 
     /**
