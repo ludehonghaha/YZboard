@@ -22,6 +22,8 @@ class SmartRelayController extends Controller
                     'type' => $child->type,
                 ])->values()->all()
                 : [];
+            $machine = $entry->machine;
+            $runtime = (array) ($machine?->agent_runtime ?? []);
             return [
                 'id' => (int) $entry->id,
                 'name' => $entry->name,
@@ -30,6 +32,13 @@ class SmartRelayController extends Controller
                 'children' => $children,
                 'existing_landings' => SmartRoutingService::reusableLandings($entry),
                 'smart_relay' => $entry->smart_relay,
+                'runtime' => [
+                    'agent_version' => (string) ($runtime['version'] ?? ''),
+                    'agent_online' => \App\Services\NodeSyncService::isNodeOnline((int) $entry->id),
+                    'kernel_running' => data_get($entry->load_status, 'kernel_status') === true,
+                    'config_sent_at' => (int) ($entry->last_push_at ?? 0),
+                    'verified_egress' => false,
+                ],
             ];
         })->values()->all();
 
