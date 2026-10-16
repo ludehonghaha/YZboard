@@ -11,10 +11,6 @@ use App\Services\SubscriptionClientControl;
 use App\Services\UserService;
 use App\Utils\Helper;
 use Illuminate\Http\Request;
-use BaconQrCode\Renderer\Image\SvgImageBackEnd;
-use BaconQrCode\Renderer\ImageRenderer;
-use BaconQrCode\Renderer\RendererStyle\RendererStyle;
-use BaconQrCode\Writer;
 
 class ClientController extends Controller
 {
@@ -60,53 +56,7 @@ class ClientController extends Controller
             ]);
         }
 
-        // Opening the standard link in Safari/Chrome shows one-click import
-        // options. Actual clients keep receiving their original config bytes.
-        $agent = strtolower((string) $request->userAgent());
-        if (!$request->filled('flag')
-            && str_contains(strtolower((string) $request->header('Accept')), 'text/html')
-            && !preg_match('/shadowrocket|clash|mihomo|sing-box|singbox|surge|stash|loon|quantumult|v2ray|passwall|nekobox|nekoray|surfboard/', $agent)) {
-            return redirect()->route('client.import', ['token' => $user->token]);
-        }
-
         return $this->doSubscribe($request, $user);
-    }
-
-    /**
-     * Browser-safe subscription launcher. An HTTPS subscription remains the
-     * source of truth, with per-client format selected via ?flag=...
-     */
-    public function importPage(Request $request)
-    {
-        $user = $request->user();
-        if (!app(UserService::class)->isAvailable($user)) {
-            return response('订阅已失效或流量不足', 403)
-                ->header('Cache-Control', 'private, no-store');
-        }
-
-        $subscriptionUrl = Helper::getSubscribeUrl($user->token);
-        $shadowUrl = $subscriptionUrl . (str_contains($subscriptionUrl, '?') ? '&' : '?') . 'flag=shadowrocket';
-        $mihomoUrl = $subscriptionUrl . (str_contains($subscriptionUrl, '?') ? '&' : '?') . 'flag=meta';
-
-        $remark = (string) admin_setting('app_name', 'YZboard');
-        $encodedShadowUrl = rtrim(strtr(base64_encode($shadowUrl), '+/', '-_'), '=');
-        $shadowrocketLink = 'shadowrocket://add/sub://' . $encodedShadowUrl . '?remark=' . rawurlencode($remark);
-        $clashLink = 'clash://install-config?url=' . rawurlencode($mihomoUrl);
-
-        $writer = new Writer(new ImageRenderer(
-            new RendererStyle(240, 1), new SvgImageBackEnd()
-        ));
-        $pageUrl = route('client.import', ['token' => $user->token]);
-        $qrCode = base64_encode($writer->writeString($pageUrl));
-
-        return response()->view('client.import', compact(
-            'remark', 'subscriptionUrl', 'shadowUrl', 'mihomoUrl',
-            'shadowrocketLink', 'clashLink', 'qrCode'
-        ))->withHeaders([
-            'Cache-Control' => 'private, no-store',
-            'Referrer-Policy' => 'no-referrer',
-            'X-Robots-Tag' => 'noindex, nofollow',
-        ]);
     }
 
     public function doSubscribe(Request $request, $user, $servers = null)

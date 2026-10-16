@@ -11,7 +11,6 @@ use App\Http\Controllers\V2\Admin\Server\ManageController;
 use App\Http\Controllers\V2\Admin\Server\MachineController;
 use App\Http\Controllers\V2\Admin\OrderController;
 use App\Http\Controllers\V2\Admin\UserController;
-use App\Http\Controllers\V2\Admin\QuickImportController;
 use App\Http\Controllers\V2\Admin\StatController;
 use App\Http\Controllers\V2\Admin\TrafficStatisticsController;
 use App\Http\Controllers\V2\Admin\InboundIpStatisticsController;
@@ -152,12 +151,6 @@ class AdminRoute
                 $router->post('/paid', [OrderController::class, 'paid']);
                 $router->post('/cancel', [OrderController::class, 'cancel']);
                 $router->post('/detail', [OrderController::class, 'detail']);
-            });
-
-            // In-panel subscription app import, guarded by existing admin authentication.
-            $router->group(['prefix' => 'quick-import'], function ($router) {
-                $router->get('/users', [QuickImportController::class, 'users']);
-                $router->post('/links', [QuickImportController::class, 'links']);
             });
 
             // User
