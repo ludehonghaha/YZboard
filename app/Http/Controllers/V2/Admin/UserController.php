@@ -1,0 +1,735 @@
+<?php
+
+namespace App\Http\Controllers\V2\Admin;
+
+use App\Jobs\NodeGroupSyncJob;
+use App\Http\Controllers\Controller;
+use App\Http\Requests\Admin\UserGenerate;
+use App\Http\Requests\Admin\UserSendMail;
+use App\Http\Requests\Admin\UserUpdate;
+use App\Jobs\SendEmailJob;
+use App\Models\Plan;
+use App\Models\User;
+use App\Services\AuthService;
+use App\Services\Plugin\HookManager;
+use App\Services\UserService;
+use App\Services\DeviceStateService;
+use App\Services\DeviceIpLocationService;
+use App\Traits\QueryOperators;
+use App\Utils\Helper;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Query\Builder as QueryBuilder;
+use Illuminate\Http\Request;
+use Illuminate\Http\JsonResponse;
+
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+
+class UserController extends Controller
+{
+    use QueryOperators;
+
+    public function resetSecret(Request $request)
+    {
+        $user = User::find($request->input('id'));
+        if (!$user)
+            return $this->fail([400202, '用户不存在']);
+        $user->token = Helper::guid();
+        $user->uuid = Helper::guid(true);
+        $result = $user->save();
+
+        if ($result) {
+            HookManager::call('admin.user.secret.reset', [
+                'user' => $user,
+                'request' => $request,
+            ]);
+        }
+
+        return $this->success($result);
+    }
+
+    // Apply filters and sorts to the query builder.
+    private function applyFiltersAndSorts(Request $request, Builder|QueryBuilder $builder): void
+    {
+        $this->applyFilters($request, $builder);
+        $this->applySorting($request, $builder);
+    }
+
+    // Apply filters to the query builder.
+    private function applyFilters(Request $request, Builder|QueryBuilder $builder): void
+    {
+        if (!$request->has('filter')) {
+            return;
+        }
+
+        collect($request->input('filter'))->each(function ($filter) use ($builder) {
+            $field = $filter['id'];
+            $value = $filter['value'];
+            $logic = strtolower($filter['logic'] ?? 'and');
+
+            if ($logic === 'or') {
+                $builder->orWhere(function ($query) use ($field, $value) {
+                    $this->buildFilterQuery($query, $field, $value);
+                });
+            } else {
+                $builder->where(function ($query) use ($field, $value) {
+                    $this->buildFilterQuery($query, $field, $value);
+                });
+            }
+        });
+    }
+
+    // Build one filter query condition.
+    private function buildFilterQuery(Builder|QueryBuilder $query, string $field, mixed $value): void
+    {
+        // 处理关联查询
+        if (str_contains($field, '.')) {
+            if (!method_exists($query, 'whereHas')) {
+                return;
+            }
+            [$relation, $relationField] = explode('.', $field);
+            $query->whereHas($relation, function ($q) use ($relationField, $value) {
+                if (is_array($value)) {
+                    $q->whereIn($relationField, $value);
+                } else if (is_string($value) && str_contains($value, ':')) {
+                    [$operator, $filterValue] = explode(':', $value, 2);
+                    $this->applyQueryCondition($q, $relationField, $operator, $filterValue);
+                } else {
+                    $q->where($relationField, 'like', "%{$value}%");
+                }
+            });
+            return;
+        }
+
+        // 处理数组值的 'in' 操作
+        if (is_array($value)) {
+            if ($field === 'group_ids') {
+                $query->where(function ($query) use ($value) {
+                    $query->whereIn('group_id', $value);
+                    foreach ($value as $groupId) {
+                        $query->orWhereJsonContains('group_ids', (int) $groupId);
+                    }
+                });
+            } else {
+                $query->whereIn($field, $value);
+            }
+            return;
+        }
+
+        // 处理基于运算符的过滤
+        if (!is_string($value) || !str_contains($value, ':')) {
+            $query->where($field, 'like', "%{$value}%");
+            return;
+        }
+
+        [$operator, $filterValue] = explode(':', $value, 2);
+
+        // 转换数字字符串为适当的类型
+        if (is_numeric($filterValue)) {
+            $filterValue = strpos($filterValue, '.') !== false
+                ? (float) $filterValue
+                : (int) $filterValue;
+        }
+
+        // 处理计算字段
+        $queryField = match ($field) {
+            'total_used' => DB::raw('(u + d)'),
+            default => $field
+        };
+
+        $this->applyQueryCondition($query, $queryField, $operator, $filterValue);
+    }
+
+    // Apply sorting rules to the query builder.
+    private function applySorting(Request $request, Builder|QueryBuilder $builder): void
+    {
+        if (!$request->has('sort')) {
+            return;
+        }
+
+        collect($request->input('sort'))->each(function ($sort) use ($builder) {
+            $field = $sort['id'];
+            // 运行快照不在用户表中，由列表在分页前排序。
+            if (in_array($field, ['connection_count', 'upload_speed', 'download_speed'], true)) return;
+            $direction = $sort['desc'] ? 'DESC' : 'ASC';
+            $builder->orderBy($field, $direction);
+        });
+    }
+
+    // Resolve bulk operation scope and normalize user_ids.
+    private function resolveScope(Request $request): array
+    {
+        $scope = $request->input('scope');
+        $userIds = $request->input('user_ids');
+
+        $hasSelection = is_array($userIds) && count(array_filter($userIds, static fn($v) => is_numeric($v))) > 0;
+        $hasFilter = $request->has('filter') && !empty($request->input('filter'));
+
+        if (!in_array($scope, ['selected', 'filtered', 'all'], true)) {
+            if ($hasSelection) {
+                $scope = 'selected';
+            } elseif ($hasFilter) {
+                $scope = 'filtered';
+            } else {
+                $scope = 'all';
+            }
+        }
+
+        $normalizedIds = [];
+        if ($scope === 'selected') {
+            $normalizedIds = is_array($userIds) ? $userIds : [];
+            $normalizedIds = array_values(array_unique(array_map(static function ($v) {
+                return is_numeric($v) ? (int) $v : null;
+            }, $normalizedIds)));
+            $normalizedIds = array_values(array_filter($normalizedIds, static fn($v) => is_int($v)));
+        }
+
+        return [
+            'scope' => $scope,
+            'user_ids' => $normalizedIds,
+        ];
+    }
+
+    // Fetch paginated user list (filters + sorting).
+    public function fetch(Request $request)
+    {
+        app(\App\Services\TelemetryDemand::class)->renew(['users']);
+        $current = $request->input('current', 1);
+        $pageSize = $request->input('pageSize', 10);
+
+        $userModel = User::query()
+            ->with(['plan:id,name', 'invite_user:id,email', 'group:id,name'])
+            ->select((new User())->getTable() . '.*')
+            ->selectRaw('(u + d) as total_used');
+
+        $userModel = HookManager::filter('admin.user.fetch.query', $userModel, $request);
+
+        $this->applyFiltersAndSorts($request, $userModel);
+
+        $runtimeSorts = collect($request->input('sort', []))->filter(fn ($sort) =>
+            in_array($sort['id'], ['connection_count', 'upload_speed', 'download_speed'], true));
+        $connections = $speeds = null;
+        if ($runtimeSorts->isNotEmpty()) {
+            // 仅加载排序需要的用户资料；复用同一批快照，避免排序与返回值跨采样周期。
+            $candidates = (clone $userModel)->withoutEagerLoads()
+                ->select(['id', 'group_id', 'group_ids'])->selectRaw('(u + d) as total_used')
+                ->orderBy('id', 'desc')->get();
+            $connections = app(\App\Services\UserConnectionService::class)->forUsers($candidates);
+            $speeds = app(\App\Services\UserSpeedService::class)->forUsers($candidates);
+            $ranked = $candidates->sort(function ($left, $right) use ($runtimeSorts, $connections, $speeds) {
+                foreach ($runtimeSorts as $sort) {
+                    $field = $sort['id'];
+                    $values = $field === 'connection_count' ? $connections : $speeds;
+                    $a = $values[$left->id][$field];
+                    $b = $values[$right->id][$field];
+                    // 未知永远放在末尾，不能冒充零值参与升降序。
+                    if ($a === null || $b === null) {
+                        if ($a !== $b) return $a === null ? 1 : -1;
+                    } elseif ($a !== $b) {
+                        return ($a <=> $b) * ($sort['desc'] ? -1 : 1);
+                    }
+                }
+                return 0; // 保留数据库的次级排序和编号顺序。
+            })->values();
+            $pageIds = $ranked->forPage(max(1, (int) $current), max(1, (int) $pageSize))->pluck('id');
+            $pageUsers = (clone $userModel)->whereIn('id', $pageIds)->get()->keyBy('id');
+            $users = new \Illuminate\Pagination\LengthAwarePaginator(
+                $pageIds->map(fn ($id) => $pageUsers->get($id))->filter()->values(),
+                $ranked->count(), max(1, (int) $pageSize), max(1, (int) $current)
+            );
+        } else {
+            $users = $userModel->orderBy('id', 'desc')
+                ->paginate($pageSize, ['*'], 'page', $current);
+        }
+
+        $groups = \App\Models\ServerGroup::query()->get(['id', 'name'])->keyBy('id');
+        $connections ??= app(\App\Services\UserConnectionService::class)->forUsers($users->getCollection());
+        $speeds ??= app(\App\Services\UserSpeedService::class)->forUsers($users->getCollection());
+        $users->getCollection()->transform(function ($user) use ($groups, $connections, $speeds): array {
+            $user->setAttribute('groups', collect($user->effectiveGroupIds())
+                ->map(fn (int $id) => $groups->get($id))->filter()->values());
+            foreach ($connections[$user->id] + $speeds[$user->id] as $key => $value) {
+                $user->setAttribute($key, $value);
+            }
+            return self::transformUserData($user);
+        });
+
+        return $this->paginate($users);
+    }
+
+    // Transform user fields for API response.
+    public static function transformUserData(User $user): array
+    {
+        $model = $user;
+        $user = $user->toArray();
+        $user['balance'] = $user['balance'] / 100;
+        $user['commission_balance'] = $user['commission_balance'] / 100;
+        $user['subscribe_url'] = Helper::getSubscribeUrl($user['token']);
+        return HookManager::filter('admin.user.transform', $user, $model);
+    }
+
+    public function getUserInfoById(Request $request)
+    {
+        $request->validate([
+            'id' => 'required|numeric'
+        ], [
+            'id.required' => '用户ID不能为空'
+        ]);
+        $user = User::find($request->input('id'))->load('invite_user');
+        $user = HookManager::filter('admin.user.detail', $user, $request);
+        return $this->success($user);
+    }
+
+    /** 返回当前实际计数的公网来源 IP，位置优先外部查询、失败回退本地。 */
+    public function devices(Request $request, DeviceStateService $devices, DeviceIpLocationService $locations): JsonResponse
+    {
+        $data = $request->validate(['id' => 'required|integer|min:1']);
+        if (!User::query()->whereKey($data['id'])->exists()) {
+            return response()->json(['message' => '用户不存在'], 404);
+        }
+        $result = [];
+        foreach ($locations->lookupMany($devices->getDeviceIPs((int) $data['id'])) as $ip => $location) {
+            $result[] = ['ip' => $ip] + $location;
+        }
+        return response()->json(['data' => $result]);
+    }
+
+    public function update(UserUpdate $request)
+    {
+        $params = $request->validated();
+
+        $user = User::find($request->input('id'));
+        if (!$user) {
+            return $this->fail([400202, '用户不存在']);
+        }
+        if (isset($params['email'])) {
+            if (User::byEmail($params['email'])->first() && $user->email !== $params['email']) {
+                return $this->fail([400201, '邮箱已被使用']);
+            }
+        }
+        // 处理密码
+        if (isset($params['password'])) {
+            $params['password'] = password_hash($params['password'], PASSWORD_DEFAULT);
+            $params['password_algo'] = NULL;
+        } else {
+            unset($params['password']);
+        }
+        // 处理订阅计划
+        if (isset($params['plan_id'])) {
+            $plan = Plan::find($params['plan_id']);
+            if (!$plan) {
+                return $this->fail([400202, '订阅计划不存在']);
+            }
+            $params['group_id'] = $plan->group_id;
+            $params['group_ids'] = $plan->effectiveGroupIds();
+            if ((int) $plan->id !== (int) $user->plan_id) {
+                // 换套餐时流量、限速、设备数和连接数按套餐同步，与订单开通保持一致；同一次编辑里手填的值优先。
+                $params += [
+                    'transfer_enable' => $plan->transfer_enable * 1073741824,
+                    'speed_limit' => $plan->speed_limit,
+                    'device_limit' => $plan->device_limit,
+                    'conn_limit' => $plan->conn_limit,
+                    'conn_rate_limit' => $plan->conn_rate_limit,
+                ];
+            }
+        }
+        // 处理邀请用户
+        if ($request->input('invite_user_email') && $inviteUser = User::byEmail($request->input('invite_user_email'))->first()) {
+            $params['invite_user_id'] = $inviteUser->id;
+        } else {
+            $params['invite_user_id'] = null;
+        }
+
+        if (isset($params['banned']) && (int) $params['banned'] === 1) {
+            $authService = new AuthService($user);
+            $authService->removeAllSessions();
+        }
+        if (isset($params['balance'])) {
+            $params['balance'] = $params['balance'] * 100;
+        }
+        if (isset($params['commission_balance'])) {
+            $params['commission_balance'] = $params['commission_balance'] * 100;
+        }
+
+        $params = HookManager::filter('admin.user.update.params', $params, $request, $user);
+
+        HookManager::call('admin.user.update.before', [
+            'user' => $user,
+            'params' => $params,
+            'request' => $request,
+        ]);
+
+        try {
+            $user->update($params);
+        } catch (\Exception $e) {
+            Log::error($e);
+            return $this->fail([500, '保存失败']);
+        }
+
+        HookManager::call('admin.user.update.after', [
+            'user' => $user->refresh(),
+            'params' => $params,
+            'request' => $request,
+        ]);
+
+        return $this->success(true);
+    }
+
+    /** 只延长明确选中且尚未到期的用户，保留永久有效状态。 */
+    public function extendDuration(Request $request)
+    {
+        $data = $request->validate([
+            'user_ids' => 'required|array|min:1|max:1000',
+            'user_ids.*' => 'required|integer|min:1',
+            'days' => 'required|integer|min:1|max:36500',
+        ]);
+        $ids = array_values(array_unique($data['user_ids']));
+        $seconds = (int) $data['days'] * 86400;
+
+        $updated = DB::transaction(function () use ($ids, $seconds) {
+            // 固定加锁顺序，读取锁内最新到期时间，避免并发续期丢失。
+            $users = User::query()->whereIn('id', $ids)->orderBy('id')->lockForUpdate()->get();
+            $now = now()->timestamp;
+            $updated = 0;
+            foreach ($users as $user) {
+                if ($user->expired_at === null || $user->expired_at <= $now) {
+                    continue;
+                }
+                if ($user->expired_at > 253402300799 - $seconds) {
+                    throw \Illuminate\Validation\ValidationException::withMessages([
+                        'days' => '增加后到期时间超出支持范围',
+                    ]);
+                }
+                $user->expired_at += $seconds;
+                // 保留模型观察器的流量重置日期重算及节点用户同步。
+                $user->saveOrFail();
+                $updated++;
+            }
+            return $updated;
+        });
+
+        return $this->success(['updated' => $updated, 'skipped' => count($ids) - $updated]);
+    }
+
+    // Export users to CSV.
+    public function dumpCSV(Request $request)
+    {
+        ini_set('memory_limit', '-1');
+        gc_enable(); // 启用垃圾回收
+
+        $scopeInfo = $this->resolveScope($request);
+        $scope = $scopeInfo['scope'];
+        $userIds = $scopeInfo['user_ids'];
+
+        if ($scope === 'selected') {
+            if (empty($userIds)) {
+                return $this->fail([422, 'user_ids不能为空']);
+            }
+        }
+
+        // 优化查询：使用with预加载plan关系，避免N+1问题
+        $query = User::query()
+            ->with('plan:id,name')
+            ->orderBy('id', 'asc')
+            ->select([
+                'email',
+                'balance',
+                'commission_balance',
+                'transfer_enable',
+                'u',
+                'd',
+                'expired_at',
+                'token',
+                'plan_id'
+            ]);
+
+        if ($scope === 'selected') {
+            $query->whereIn('id', $userIds);
+        } elseif ($scope === 'filtered') {
+            $this->applyFiltersAndSorts($request, $query);
+        } // all: ignore filter/sort
+
+        $filename = 'users_' . date('Y-m-d_His') . '.csv';
+
+        return response()->streamDownload(function () use ($query) {
+            // 打开输出流
+            $output = fopen('php://output', 'w');
+
+            // 添加BOM标记，确保Excel正确显示中文
+            fprintf($output, chr(0xEF) . chr(0xBB) . chr(0xBF));
+
+            // 写入CSV头部
+            fputcsv($output, [
+                '邮箱',
+                '余额',
+                '推广佣金',
+                '总流量',
+                '剩余流量',
+                '套餐到期时间',
+                '订阅计划',
+                '订阅地址'
+            ]);
+
+            // 分批处理数据以减少内存使用
+            $query->chunk(500, function ($users) use ($output) {
+                foreach ($users as $user) {
+                    try {
+                        $row = [
+                            $user->email,
+                            number_format($user->balance / 100, 2),
+                            number_format($user->commission_balance / 100, 2),
+                            Helper::trafficConvert($user->transfer_enable),
+                            Helper::trafficConvert($user->transfer_enable - ($user->u + $user->d)),
+                            $user->expired_at ? date('Y-m-d H:i:s', $user->expired_at) : '长期有效',
+                            $user->plan ? $user->plan->name : '无订阅',
+                            Helper::getSubscribeUrl($user->token)
+                        ];
+                        fputcsv($output, $row);
+                    } catch (\Exception $e) {
+                        Log::error('CSV导出错误: ' . $e->getMessage(), [
+                            'user_id' => $user->id,
+                            'email' => $user->email
+                        ]);
+                        continue; // 继续处理下一条记录
+                    }
+                }
+
+                // 清理内存
+                gc_collect_cycles();
+            });
+
+            fclose($output);
+        }, $filename, [
+            'Content-Type' => 'text/csv; charset=UTF-8',
+            'Content-Disposition' => 'attachment; filename="' . $filename . '"'
+        ]);
+    }
+
+    public function generate(UserGenerate $request)
+    {
+        $prefix = (string) $request->input('email_prefix');
+        $suffix = (string) $request->input('email_suffix');
+        $count = (int) $request->input('generate_count');
+
+        if ($prefix !== '') {
+            $emails = $count > 0
+                ? array_map(fn (int $index) => "{$prefix}_{$index}@{$suffix}", range(1, $count))
+                : ["{$prefix}@{$suffix}"];
+            foreach ($emails as $email) {
+                if (User::byEmail($email)->exists()) {
+                    return $this->fail([400201, $count > 0 ? "邮箱 {$email} 已存在于系统中" : '邮箱已存在于系统中']);
+                }
+            }
+        } elseif ($count > 0) {
+            $emails = array_map(fn () => Helper::randomChar(6) . '@' . $suffix, range(1, $count));
+        } else {
+            return $this->fail([422, '请填写账号或生成数量']);
+        }
+
+        $password = $request->input('password');
+        try {
+            $created = DB::transaction(function () use ($emails, $password, $request) {
+                $userService = app(UserService::class);
+                $created = [];
+                foreach ($emails as $email) {
+                    // 未指定密码时每个账号使用独立的随机密码，明文只在本次响应或导出中返回一次。
+                    $plain = $password ?? Helper::randomChar(12);
+                    $user = $userService->createUser([
+                        'email' => $email,
+                        'password' => $plain,
+                        'plan_id' => $request->input('plan_id'),
+                        'expired_at' => $request->input('expired_at'),
+                    ]);
+                    if (!$user->save()) {
+                        throw new \RuntimeException('生成失败');
+                    }
+                    $created[] = [
+                        'email' => $user->email,
+                        'password' => $plain,
+                        'expired_at' => $user->expired_at === null ? '长期有效' : date('Y-m-d H:i:s', $user->expired_at),
+                        'uuid' => $user->uuid,
+                        'created_at' => date('Y-m-d H:i:s', $user->created_at),
+                        'subscribe_url' => Helper::getSubscribeUrl($user->token),
+                    ];
+                }
+                return $created;
+            });
+        } catch (\Exception $e) {
+            Log::error($e);
+            return $this->fail([500, '生成失败']);
+        }
+
+        if ($request->input('download_csv')) {
+            return response()->streamDownload(function () use ($created) {
+                $handle = fopen('php://output', 'w');
+                fputcsv($handle, ['账号', '密码', '过期时间', 'UUID', '创建时间', '订阅地址']);
+                foreach ($created as $row) {
+                    fputcsv($handle, [
+                        $row['email'],
+                        $row['password'],
+                        $row['expired_at'],
+                        $row['uuid'],
+                        $row['created_at'],
+                        $row['subscribe_url'],
+                    ]);
+                }
+                fclose($handle);
+            }, 'users.csv', [
+                'Content-Type' => 'text/csv',
+                'Content-Disposition' => 'attachment; filename="users.csv"',
+            ]);
+        }
+
+        return $this->success($created);
+    }
+
+    public function sendMail(UserSendMail $request)
+    {
+        ini_set('memory_limit', '-1');
+        $scopeInfo = $this->resolveScope($request);
+        $scope = $scopeInfo['scope'];
+        $userIds = $scopeInfo['user_ids'];
+
+        if ($scope === 'selected') {
+            if (empty($userIds)) {
+                return $this->fail([422, 'user_ids不能为空']);
+            }
+        }
+
+        $sortType = in_array($request->input('sort_type'), ['ASC', 'DESC']) ? $request->input('sort_type') : 'DESC';
+        $sort = $request->input('sort') ? $request->input('sort') : 'created_at';
+
+        $builder = User::query()
+            ->with('plan:id,name')
+            ->orderBy('id', 'desc');
+
+        if ($scope === 'filtered') {
+            // filtered: apply filters/sort
+            $builder->orderBy($sort, $sortType);
+            $this->applyFiltersAndSorts($request, $builder);
+        } elseif ($scope === 'selected') {
+            $builder->whereIn('id', $userIds);
+        } // all: ignore filter/sort
+
+        $subject = $request->input('subject');
+        $content = $request->input('content');
+        $appName = admin_setting('app_name', 'XBoard');
+        $appUrl = admin_setting('app_url');
+
+        $chunkSize = 1000;
+
+        $builder->chunk($chunkSize, function ($users) use ($subject, $content, $appName, $appUrl) {
+            foreach ($users as $user) {
+                $vars = [
+                    'app.name' => $appName,
+                    'app.url' => $appUrl,
+                    'now' => now()->format('Y-m-d H:i:s'),
+                    'user.id' => $user->id,
+                    'user.email' => $user->email,
+                    'user.uuid' => $user->uuid,
+                    'user.plan_name' => $user->plan?->name ?? '',
+                    'user.expired_at' => $user->expired_at ? date('Y-m-d H:i:s', $user->expired_at) : '',
+                    'user.transfer_enable' => (int) ($user->transfer_enable ?? 0),
+                    'user.transfer_used' => (int) (($user->u ?? 0) + ($user->d ?? 0)),
+                    'user.transfer_left' => (int) (($user->transfer_enable ?? 0) - (($user->u ?? 0) + ($user->d ?? 0))),
+                ];
+
+                $templateValue = [
+                    'name' => $appName,
+                    'url' => $appUrl,
+                    'content' => $content,
+                    'vars' => $vars,
+                    'content_mode' => 'text',
+                ];
+
+                dispatch(new SendEmailJob([
+                    'email' => $user->email,
+                    'subject' => $subject,
+                    'template_name' => 'notify',
+                    'template_value' => $templateValue
+                ], 'send_email_mass'));
+            }
+        });
+
+        return $this->success(true);
+    }
+
+    public function ban(Request $request)
+    {
+        $scopeInfo = $this->resolveScope($request);
+        $scope = $scopeInfo['scope'];
+        $userIds = $scopeInfo['user_ids'];
+
+        if ($scope === 'selected') {
+            if (empty($userIds)) {
+                return $this->fail([422, 'user_ids不能为空']);
+            }
+        }
+
+        $sortType = in_array($request->input('sort_type'), ['ASC', 'DESC']) ? $request->input('sort_type') : 'DESC';
+        $sort = $request->input('sort') ? $request->input('sort') : 'created_at';
+
+        $builder = User::query()->orderBy('id', 'desc');
+
+        if ($scope === 'filtered') {
+            // filtered: keep current semantics
+            $builder->orderBy($sort, $sortType);
+            $this->applyFiltersAndSorts($request, $builder);
+        } elseif ($scope === 'selected') {
+            $builder->whereIn('id', $userIds);
+        } // all: ignore filter/sort
+
+        try {
+            $groupIds = (clone $builder)->reorder()->get(['group_id', 'group_ids'])
+                ->flatMap(fn (User $user) => $user->effectiveGroupIds())
+                ->unique()->all();
+            $builder->update([
+                'banned' => 1
+            ]);
+        } catch (\Exception $e) {
+            Log::error($e);
+            return $this->fail([500, '处理失败']);
+        }
+        if ($groupIds !== []) {
+            NodeGroupSyncJob::dispatch($groupIds);
+        }
+        return $this->success(true);
+    }
+
+    // Delete user and related data.
+    public function destroy(Request $request)
+    {
+        $request->validate([
+            'id' => 'required|exists:App\Models\User,id'
+        ], [
+            'id.required' => '用户ID不能为空',
+            'id.exists' => '用户不存在'
+        ]);
+        $user = User::find($request->input('id'));
+        HookManager::call('admin.user.destroy.before', [
+            'user' => $user,
+            'request' => $request,
+        ]);
+
+        try {
+            DB::beginTransaction();
+            $user->orders()->delete();
+            $user->codes()->delete();
+            $user->stat()->delete();
+            $user->tickets()->delete();
+            $user->delete();
+            DB::commit();
+
+            HookManager::call('admin.user.destroy.after', [
+                'user' => $user,
+                'request' => $request,
+            ]);
+
+            return $this->success(true);
+        } catch (\Exception $e) {
+            DB::rollBack();
+            Log::error($e);
+            return $this->fail([500, '删除失败']);
+        }
+    }
+}

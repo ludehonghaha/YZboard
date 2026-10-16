@@ -1,0 +1,413 @@
+<?php
+
+
+namespace App\Http\Requests\Admin;
+
+use App\Models\Server;
+use App\Rules\SourcePolicyIp;
+use App\Services\ServerRelayService;
+use App\Services\ServerRouteService;
+use Illuminate\Contracts\Validation\Validator;
+use Illuminate\Foundation\Http\FormRequest;
+
+class ServerSave extends FormRequest
+{
+    protected function prepareForValidation(): void
+    {
+        $sourcePolicy = $this->input('source_policy');
+        if (is_array($sourcePolicy)) {
+            if (array_key_exists('block_cn', $sourcePolicy)
+                && in_array($sourcePolicy['block_cn'], [true, false, 0, 1, '0', '1'], true)) {
+                $sourcePolicy['block_cn'] = (bool) $sourcePolicy['block_cn'];
+            }
+            if (is_array($sourcePolicy['allow_ips'] ?? null)) {
+                $sourcePolicy['allow_ips'] = array_values(array_map([SourcePolicyIp::class, 'normalize'], $sourcePolicy['allow_ips']));
+            }
+            $this->merge(['source_policy' => $sourcePolicy]);
+        }
+        // 与列表绑定操作保持一致，0 表示取消绑定，不能作为机器外键保存。
+        if (in_array($this->input('machine_id'), [0, '0'], true)) {
+            $this->merge(['machine_id' => null]);
+        }
+
+        // 在校验前写入新建默认值，保证中转校验与最终保存的内核一致。
+        // 编辑时保留已有值，包括仍按 Xray 解释的历史空值。
+        if (!$this->input('id') && !$this->filled('kernel_type')) {
+            $this->merge(['kernel_type' => Server::defaultKernelType($this->input('type'))]);
+        }
+
+        // 新建节点未提交路由时，选中“新增节点默认应用”的路由；显式提交（包括空列表）以提交值为准。
+        if (!$this->input('id') && !$this->has('route_ids')) {
+            $defaultRouteIds = ServerRouteService::defaultRouteIdsForNewNode();
+            if ($defaultRouteIds !== []) {
+                $this->merge(['route_ids' => $defaultRouteIds]);
+            }
+        }
+    }
+
+    private const UTLS_RULES = [
+        'utls.enabled' => 'nullable|boolean',
+        'utls.fingerprint' => 'nullable|string',
+    ];
+
+    private const MULTIPLEX_RULES = [
+        'multiplex.enabled' => 'nullable|boolean',
+        'multiplex.protocol' => 'nullable|string',
+        'multiplex.max_connections' => 'nullable|integer',
+        'multiplex.min_streams' => 'nullable|integer',
+        'multiplex.max_streams' => 'nullable|integer',
+        'multiplex.padding' => 'nullable|boolean',
+        'multiplex.brutal.enabled' => 'nullable|boolean',
+        'multiplex.brutal.up_mbps' => 'nullable|integer',
+        'multiplex.brutal.down_mbps' => 'nullable|integer',
+    ];
+
+    private const ECH_RULES = [
+        'enabled' => 'nullable|boolean',
+        'config' => 'nullable|string',
+        'query_server_name' => 'nullable|string',
+        'key' => 'nullable|string',
+    ];
+
+    private const REALITY_RULES = [
+        'reality_settings.allow_insecure' => 'nullable|boolean',
+        'reality_settings.server_name' => 'nullable|string',
+        'reality_settings.server_port' => 'nullable|integer',
+        'reality_settings.public_key' => 'nullable|string',
+        'reality_settings.private_key' => 'nullable|string',
+        'reality_settings.short_id' => 'nullable|string',
+        'reality_settings.anti_abuse' => 'nullable|boolean',
+    ];
+
+    private const PROTOCOL_RULES = [
+        'wireguard' => [
+            'mtu' => 'nullable|integer|min:1280|max:1500',
+            'keepalive' => 'nullable|integer|min:0|max:65535',
+        ],
+        'shadowsocks' => [
+            'cipher' => 'required|string',
+            'obfs' => 'nullable|string',
+            'obfs_settings.path' => 'nullable|string',
+            'obfs_settings.host' => 'nullable|string',
+            'plugin' => 'nullable|string',
+            'plugin_opts' => 'nullable|string',
+        ],
+        'vmess' => [
+            'tls' => 'required|integer',
+            'network' => 'required|string',
+            'network_settings' => 'nullable|array',
+            'rules' => 'nullable|array',
+        ],
+        'trojan' => [
+            'tls' => 'nullable|integer',
+            'network' => 'required|string',
+            'network_settings' => 'nullable|array',
+            'server_name' => 'nullable|string',
+            'allow_insecure' => 'nullable|boolean',
+        ],
+        'hysteria' => [
+            'version' => 'required|integer',
+            'alpn' => 'nullable|string',
+            'obfs.open' => 'nullable|boolean',
+            'obfs.type' => 'string|nullable',
+            'obfs.password' => 'string|nullable',
+            'bandwidth.up' => 'nullable|integer',
+            'bandwidth.down' => 'nullable|integer',
+            'hop_interval' => 'integer|nullable',
+        ],
+        'vless' => [
+            'tls' => 'required|integer',
+            'network' => 'required|string',
+            'network_settings' => 'nullable|array',
+            'flow' => 'nullable|string',
+            'encryption' => 'nullable|array',
+            'encryption.enabled' => 'nullable|boolean',
+            'encryption.encryption' => 'nullable|string',
+            'encryption.decryption' => 'nullable|string',
+        ],
+        'socks' => [
+            'tls' => 'nullable|integer',
+        ],
+        'naive' => [
+            'tls' => 'required|integer',
+        ],
+        'http' => [
+            'tls' => 'required|integer',
+        ],
+        'tuic' => [
+            'version' => 'nullable|integer',
+            'congestion_control' => 'nullable|string',
+            'alpn' => 'nullable|array',
+            'udp_relay_mode' => 'nullable|string',
+        ],
+        'mieru' => [
+            'transport' => 'required|string|in:TCP,UDP',
+            'traffic_pattern' => 'string',
+        ],
+        'anytls' => [
+            'tls' => 'nullable|array',
+            'alpn' => 'nullable|string',
+            'padding_scheme' => 'nullable|array',
+        ],
+    ];
+
+    private function getBaseRules(): array
+    {
+        return [
+            'type' => 'required|in:' . implode(',', Server::VALID_TYPES),
+            'spectific_key' => 'nullable|string',
+            'code' => 'nullable|string',
+            'show' => '',
+            'name' => 'required|string',
+            'group_ids' => 'nullable|array',
+            'route_ids' => 'nullable|array',
+            'parent_id' => 'nullable|integer',
+            'relay_entry_id' => 'nullable|integer',
+            'relay_rate_override' => 'sometimes|boolean',
+            'machine_id' => 'nullable|integer',
+            'kernel_type' => 'nullable|string|in:xray,singbox,sing-box',
+            'enabled' => 'nullable|boolean',
+            'host' => 'required',
+            'port' => 'required',
+            'server_port' => 'required|integer|min:1|max:65535',
+            'tags' => 'nullable|array',
+            'excludes' => 'nullable|array',
+            'ips' => 'nullable|array',
+            'rate' => 'required|numeric|min:0',
+            'rate_time_enable' => 'nullable|boolean',
+            'rate_time_ranges' => 'nullable|array',
+            'custom_outbounds' => 'nullable|array',
+            'custom_routes' => 'nullable|array',
+            'source_policy' => 'nullable|array:block_cn,allow_ips',
+            'source_policy.block_cn' => 'required_with:source_policy|boolean',
+            'source_policy.allow_ips' => 'sometimes|array|max:128',
+            'source_policy.allow_ips.*' => ['bail', 'string', 'distinct', new SourcePolicyIp()],
+            'cert_config' => 'nullable|array',
+            'rate_time_ranges.*.start' => 'required_with:rate_time_ranges|string|date_format:H:i',
+            'rate_time_ranges.*.end' => 'required_with:rate_time_ranges|string|date_format:H:i',
+            'rate_time_ranges.*.rate' => 'required_with:rate_time_ranges|numeric|min:0',
+            'protocol_settings' => 'array',
+            'transfer_enable' => 'nullable|integer|min:0',
+        ];
+    }
+
+    private function getProtocolRules(string $type): array
+    {
+        $rules = self::PROTOCOL_RULES[$type] ?? [];
+
+        return match ($type) {
+            'vmess' => array_merge(
+                $rules,
+                $this->buildTlsSettingsRules(),
+                self::MULTIPLEX_RULES,
+                self::UTLS_RULES,
+            ),
+            'trojan' => array_merge(
+                $rules,
+                $this->buildTlsSettingsRules(includeRoot: true),
+                self::REALITY_RULES,
+                self::MULTIPLEX_RULES,
+                self::UTLS_RULES,
+            ),
+            'hysteria' => array_merge(
+                $rules,
+                $this->buildTlsObjectRules(),
+            ),
+            'tuic' => array_merge(
+                $rules,
+                $this->buildTlsObjectRules(),
+            ),
+            'mieru' => array_merge(
+                $rules,
+                self::MULTIPLEX_RULES,
+            ),
+            'vless' => array_merge(
+                $rules,
+                $this->buildTlsSettingsRules(),
+                self::REALITY_RULES,
+                self::MULTIPLEX_RULES,
+                self::UTLS_RULES,
+            ),
+            'socks', 'naive', 'http' => array_merge(
+                $rules,
+                $this->buildTlsSettingsRules(includeRoot: $type !== 'socks'),
+            ),
+            'anytls' => array_merge(
+                $rules,
+                $this->buildTlsObjectRules(includeRoot: true),
+            ),
+            default => $rules,
+        };
+    }
+
+    private function buildTlsSettingsRules(bool $includeRoot = false): array
+    {
+        return array_merge(
+            $includeRoot ? ['tls_settings' => 'nullable|array'] : [],
+            [
+                'tls_settings.server_name' => 'nullable|string',
+                'tls_settings.allow_insecure' => 'nullable|boolean',
+                'tls_settings.ech' => 'nullable|array',
+            ],
+            $this->prefixRules('tls_settings.ech.', self::ECH_RULES),
+        );
+    }
+
+    private function buildTlsObjectRules(bool $includeRoot = false): array
+    {
+        return array_merge(
+            $includeRoot ? ['tls' => 'nullable|array'] : [],
+            [
+                'tls.server_name' => 'nullable|string',
+                'tls.allow_insecure' => 'nullable|boolean',
+                'tls.ech' => 'nullable|array',
+            ],
+            $this->prefixRules('tls.ech.', self::ECH_RULES),
+        );
+    }
+
+    private function prefixRules(string $prefix, array $rules): array
+    {
+        $result = [];
+        foreach ($rules as $field => $rule) {
+            $result[$prefix . $field] = $rule;
+        }
+        return $result;
+    }
+
+    public function rules(): array
+    {
+        $type = $this->input('type');
+        $rules = $this->getBaseRules();
+        $protocolRules = $this->getProtocolRules($type);
+
+        foreach ($protocolRules as $field => $rule) {
+            $rules['protocol_settings.' . $field] = $rule;
+        }
+
+        if ($type === Server::TYPE_HYSTERIA && (int) $this->input('protocol_settings.version', 2) === 2) {
+            $rules['port'] = ['required', function ($attribute, $value, $fail) {
+                if (!is_string($value) && !is_int($value)) {
+                    $fail('连接端口格式无效');
+                    return;
+                }
+                try {
+                    \App\Utils\PortSet::parse((string) $value);
+                } catch (\InvalidArgumentException $exception) {
+                    $fail($exception->getMessage());
+                }
+            }];
+            $rules['server_port'] = 'required|integer|min:1|max:65535';
+            $rules['protocol_settings.hop_interval'] = 'nullable|integer|min:5';
+        }
+
+        return $rules;
+    }
+
+    /**
+     * 校验中转拓扑、内核、入口协议和内部协议参数。
+     */
+    public function withValidator(Validator $validator): void
+    {
+        $validator->after(function (Validator $validator) {
+            $selfId = $this->input('id') !== null ? (int) $this->input('id') : null;
+            $existing = $selfId !== null ? Server::find($selfId) : null;
+            $policy = $this->input('source_policy', $existing?->source_policy);
+            if ($this->input('type') === Server::TYPE_WIREGUARD && $this->input('relay_entry_id') && data_get($policy, 'block_cn')) {
+                $validator->errors()->add('source_policy', 'WireGuard 中转落地请在前置入口设置大陆来源拦截');
+            }
+            // 0、空串和 null 都表示“不使用中转”，管理端会把“无”提交为 0。
+            // 编辑时省略可选字段表示保留已保存值，校验必须与实际更新一致。
+            $entryId = (int) $this->input('relay_entry_id', $existing?->relay_entry_id);
+
+            $error = ServerRelayService::validateEntry(
+                $selfId,
+                $entryId > 0 ? $entryId : null,
+                $this->input('type'),
+                (array) $this->input('protocol_settings', []),
+                $this->input('host'),
+                $this->input('kernel_type', $existing?->kernel_type),
+            );
+
+            if ($error !== null) {
+                $validator->errors()->add('relay_entry_id', $error);
+            }
+        });
+    }
+
+    public function attributes(): array
+    {
+        return [
+            'source_policy' => '来源限制',
+            'source_policy.block_cn' => '屏蔽大陆来源 IP',
+            'source_policy.allow_ips' => '例外放行 IP',
+            'source_policy.allow_ips.*' => '例外放行 IP',
+            'protocol_settings.cipher' => '加密方式',
+            'protocol_settings.obfs' => '混淆类型',
+            'protocol_settings.network' => '传输协议',
+            'protocol_settings.port_range' => '端口范围',
+            'protocol_settings.traffic_pattern' => 'Traffic Pattern',
+            'protocol_settings.transport' => '传输方式',
+            'protocol_settings.version' => '协议版本',
+            'protocol_settings.password' => '密码',
+            'protocol_settings.handshake.server' => '握手服务器',
+            'protocol_settings.handshake.server_port' => '握手端口',
+            'protocol_settings.multiplex.enabled' => '多路复用',
+            'protocol_settings.multiplex.protocol' => '复用协议',
+            'protocol_settings.multiplex.max_connections' => '最大连接数',
+            'protocol_settings.multiplex.min_streams' => '最小流数',
+            'protocol_settings.multiplex.max_streams' => '最大流数',
+            'protocol_settings.multiplex.padding' => '复用填充',
+            'protocol_settings.multiplex.brutal.enabled' => 'Brutal加速',
+            'protocol_settings.multiplex.brutal.up_mbps' => 'Brutal上行速率',
+            'protocol_settings.multiplex.brutal.down_mbps' => 'Brutal下行速率',
+            'protocol_settings.utls.enabled' => 'uTLS',
+            'protocol_settings.utls.fingerprint' => 'uTLS指纹',
+            'protocol_settings.reality_settings.anti_abuse' => '防盗用模式',
+            'protocol_settings.tls_settings.ech.enabled' => 'ECH',
+            'protocol_settings.tls_settings.ech.config' => 'ECH配置',
+            'protocol_settings.tls_settings.ech.query_server_name' => 'ECH查询域名',
+            'protocol_settings.tls_settings.ech.key' => 'ECH密钥',
+            'protocol_settings.tls.ech.enabled' => 'ECH',
+            'protocol_settings.tls.ech.config' => 'ECH配置',
+            'protocol_settings.tls.ech.query_server_name' => 'ECH查询域名',
+            'protocol_settings.tls.ech.key' => 'ECH密钥',
+        ];
+    }
+
+    public function messages()
+    {
+        return [
+            'name.required' => '节点名称不能为空',
+            'group_ids.required' => '权限组不能为空',
+            'group_ids.array' => '权限组格式不正确',
+            'route_ids.array' => '路由组格式不正确',
+            'parent_id.integer' => '父ID格式不正确',
+            'kernel_type.in' => '内核必须是 xray 或 singbox',
+            'relay_entry_id.integer' => '前置入口ID格式不正确',
+            'host.required' => '节点地址不能为空',
+            'port.required' => '连接端口不能为空',
+            'server_port.required' => '后端服务端口不能为空',
+            'server_port.integer' => '内部端口必须是整数',
+            'server_port.min' => '内部端口必须在 1 到 65535 之间',
+            'server_port.max' => '内部端口必须在 1 到 65535 之间',
+            'tls.required' => 'TLS不能为空',
+            'tags.array' => '标签格式不正确',
+            'rate.required' => '倍率不能为空',
+            'rate.numeric' => '倍率格式不正确',
+            'network.required' => '传输协议不能为空',
+            'network.in' => '传输协议格式不正确',
+            'networkSettings.array' => '传输协议配置有误',
+            'ruleSettings.array' => '规则配置有误',
+            'tlsSettings.array' => 'tls配置有误',
+            'dnsSettings.array' => 'dns配置有误',
+            'protocol_settings.*.required' => ':attribute 不能为空',
+            'protocol_settings.*.required_if' => ':attribute 不能为空',
+            'protocol_settings.*.string' => ':attribute 必须是字符串',
+            'protocol_settings.*.integer' => ':attribute 必须是整数',
+            'protocol_settings.*.in' => ':attribute 的值不合法',
+            'transfer_enable.integer' => '流量上限必须是整数',
+            'transfer_enable.min' => '流量上限不能小于0',
+        ];
+    }
+}

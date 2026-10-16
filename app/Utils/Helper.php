@@ -1,0 +1,332 @@
+<?php
+
+namespace App\Utils;
+
+use App\Services\Plugin\HookManager;
+use Illuminate\Support\Arr;
+
+class Helper
+{
+    public static function uuidToBase64($uuid, $length)
+    {
+        return base64_encode(substr($uuid, 0, $length));
+    }
+
+    /**
+     * 把 VLESS 路由编号写入 UUID 的第 7、8 字节（0 基下标 6、7），即标准写法的第三段。
+     *
+     * VLESS 身份与 HY2 认证均可使用此 UUID。Xray 校验用户前会把这两个字节清零，
+     * 因此写入编号不会影响用户身份匹配；
+     * 认证通过后内核再按原始字节还原编号供路由规则使用。编号非法或 UUID 格式不符时原样返回。
+     */
+    public static function applyVlessRoute(string $uuid, $route): string
+    {
+        if ($route === null || $route === '' || !is_numeric($route)) {
+            return $uuid;
+        }
+
+        $value = (int) $route;
+        if ($value < 0 || $value > 65535) {
+            return $uuid;
+        }
+
+        if (!preg_match('/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/', $uuid)) {
+            return $uuid;
+        }
+
+        return substr($uuid, 0, 14) . sprintf('%04x', $value) . substr($uuid, 18);
+    }
+
+    public static function getServerKey($timestamp, $length)
+    {
+        return base64_encode(substr(md5($timestamp), 0, $length));
+    }
+
+    public static function guid($format = false)
+    {
+        if (function_exists('com_create_guid') === true) {
+            return md5(trim(com_create_guid(), '{}'));
+        }
+        $data = openssl_random_pseudo_bytes(16);
+        $data[6] = chr(ord($data[6]) & 0x0f | 0x40); // set version to 0100
+        $data[8] = chr(ord($data[8]) & 0x3f | 0x80); // set bits 6-7 to 10
+        if ($format) {
+            return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($data), 4));
+        }
+        return md5(vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($data), 4)) . '-' . time());
+    }
+
+    public static function generateOrderNo(): string
+    {
+        $randomChar = random_int(10000, 99999);
+        return date('YmdHms') . substr(microtime(), 2, 6) . $randomChar;
+    }
+
+    public static function exchange($from, $to)
+    {
+        $result = file_get_contents('https://api.exchangerate.host/latest?symbols=' . $to . '&base=' . $from);
+        $result = json_decode($result, true);
+        return $result['rates'][$to];
+    }
+
+    public static function randomChar($len, $special = false)
+    {
+        $chars = array(
+            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k",
+            "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v",
+            "w", "x", "y", "z", "A", "B", "C", "D", "E", "F", "G",
+            "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R",
+            "S", "T", "U", "V", "W", "X", "Y", "Z", "0", "1", "2",
+            "3", "4", "5", "6", "7", "8", "9"
+        );
+
+        if ($special) {
+            $chars = array_merge($chars, array(
+                "!", "@", "#", "$", "?", "|", "{", "/", ":", ";",
+                "%", "^", "&", "*", "(", ")", "-", "_", "[", "]",
+                "}", "<", ">", "~", "+", "=", ",", "."
+            ));
+        }
+
+        $charsLen = count($chars) - 1;
+        shuffle($chars);
+        $str = '';
+        for ($i = 0; $i < $len; $i++) {
+            $str .= $chars[random_int(0, $charsLen)];
+        }
+        return $str;
+    }
+
+    public static function wrapIPv6($addr) {
+        if (filter_var($addr, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+            return "[$addr]";
+        } else {
+            return $addr;
+        }
+    }
+
+    public static function multiPasswordVerify($algo, $salt, $password, $hash)
+    {
+        switch($algo) {
+            case 'md5': return md5($password) === $hash;
+            case 'sha256': return hash('sha256', $password) === $hash;
+            case 'md5salt': return md5($password . $salt) === $hash;
+            case 'sha256salt': return hash('sha256', $password . $salt) === $hash;
+            default: return password_verify($password, $hash);
+        }
+    }
+
+    public static function emailSuffixVerify($email, $suffixs)
+    {
+        $suffix = preg_split('/@/', $email)[1];
+        if (!$suffix) return false;
+        if (!is_array($suffixs)) {
+            $suffixs = preg_split('/,/', $suffixs);
+        }
+        if (!in_array($suffix, $suffixs)) return false;
+        return true;
+    }
+
+    public static function trafficConvert(float $byte)
+    {
+        $kb = 1024;
+        $mb = 1048576;
+        $gb = 1073741824;
+        if ($byte > $gb) {
+            return round($byte / $gb, 2) . ' GB';
+        } else if ($byte > $mb) {
+            return round($byte / $mb, 2) . ' MB';
+        } else if ($byte > $kb) {
+            return round($byte / $kb, 2) . ' KB';
+        } else if ($byte < 0) {
+            return 0;
+        } else {
+            return round($byte, 2) . ' B';
+        }
+    }
+
+    public static function getSubscribeUrl(string $token, $subscribeUrl = null)
+    {
+        $path = route('client.subscribe', ['token' => $token], false);
+        
+        if ($subscribeUrl) {
+            $finalUrl = rtrim($subscribeUrl, '/') . $path;
+            return HookManager::filter('subscribe.url', $finalUrl);
+        }
+        
+        $urlString = (string)admin_setting('subscribe_url', '');
+        $subscribeUrlList = $urlString ? explode(',', $urlString) : [];
+        
+        if (empty($subscribeUrlList)) {
+            return HookManager::filter('subscribe.url', url($path));
+        }
+        
+        $selectedUrl = self::replaceByPattern(Arr::random($subscribeUrlList));
+        $finalUrl = rtrim($selectedUrl, '/') . $path;
+        
+        return HookManager::filter('subscribe.url', $finalUrl);
+    }
+
+    public static function randomPort($range): int {
+        if (str_contains((string) $range, ',')) {
+            return PortSet::random((string) $range);
+        }
+        $portRange = explode('-', (string) $range, 2);
+        $min = (int) ($portRange[0] ?? 0);
+        $max = (int) ($portRange[1] ?? $portRange[0] ?? 0);
+        if ($min > $max) {
+            [$min, $max] = [$max, $min];
+        }
+        return random_int($min, $max);
+    }
+
+    public static function base64EncodeUrlSafe($data)
+    {
+        $encoded = base64_encode($data);
+        return str_replace(['+', '/', '='], ['-', '_', ''], $encoded);
+    }
+
+    /**
+     * 根据规则替换域名中对应的字符串
+     *
+     * @param string $input 用户输入的字符串
+     * @return string 替换后的字符串
+     */
+    public static function replaceByPattern($input)
+    {
+        $patterns = [
+            '/\[(\d+)-(\d+)\]/' => function ($matches) {
+                $min = intval($matches[1]);
+                $max = intval($matches[2]);
+                if ($min > $max) {
+                    list($min, $max) = [$max, $min];
+                }
+                $randomNumber = random_int($min, $max);
+                return $randomNumber;
+            },
+            '/\[uuid\]/' => function () {
+                return  self::guid(true);
+            }
+        ];
+        foreach ($patterns as $pattern => $callback) {
+            $input = preg_replace_callback($pattern, $callback, $input);
+        }
+        return $input;
+    }
+
+    public static function getIpByDomainName($domain) {
+        return gethostbynamel($domain) ?: [];
+    }
+    
+    public static function getTlsFingerprint($utls = null)
+    {
+
+        if (is_array($utls) || is_object($utls)) {
+            if (!data_get($utls, 'enabled')) {
+                return null;
+            }
+            $fingerprint = data_get($utls, 'fingerprint', 'chrome');
+            if ($fingerprint !== 'random') {
+                return $fingerprint;
+            }
+        }
+
+        $fingerprints = ['chrome', 'firefox', 'safari', 'ios', 'edge', 'qq'];
+        return Arr::random($fingerprints);
+    }
+
+    public static function normalizeEchSettings($ech = null): ?array
+    {
+        if (!is_array($ech) && !is_object($ech)) {
+            return null;
+        }
+
+        if (!data_get($ech, 'enabled')) {
+            return null;
+        }
+
+        return array_filter([
+            'enabled' => true,
+            'config' => self::trimToNull(data_get($ech, 'config')),
+            'query_server_name' => self::trimToNull(data_get($ech, 'query_server_name')),
+            'key' => self::trimToNull(data_get($ech, 'key')),
+            'key_path' => self::trimToNull(data_get($ech, 'key_path')),
+            'config_path' => self::trimToNull(data_get($ech, 'config_path')),
+        ], static fn($value) => $value !== null);
+    }
+
+    /** 生成 Mihomo 客户端使用的 ECH 公共选项。 */
+    public static function toMihomoEchOptions($ech): ?array
+    {
+        if (!$normalized = self::normalizeEchSettings($ech)) {
+            return null;
+        }
+
+        return array_filter([
+            'enable' => true,
+            'config' => self::toMihomoEchConfig(data_get($normalized, 'config')),
+            'query-server-name' => data_get($normalized, 'query_server_name'),
+        ], static fn($value) => $value !== null);
+    }
+
+    public static function toMihomoEchConfig(?string $config): ?string
+    {
+        $config = self::trimToNull($config);
+        if (!$config) {
+            return null;
+        }
+
+        if (str_starts_with($config, '-----BEGIN')) {
+            if (preg_match('/-----BEGIN ECH CONFIGS-----\s*(.*?)\s*-----END ECH CONFIGS-----/s', $config, $matches)) {
+                return preg_replace('/\s+/', '', $matches[1]);
+            }
+            return null;
+        }
+
+        return preg_replace('/\s+/', '', $config);
+    }
+
+    public static function trimToNull($value): ?string
+    {
+        if (!is_string($value)) {
+            return null;
+        }
+
+        $value = trim($value);
+        return $value === '' ? null : $value;
+    }
+
+    public static function encodeURIComponent($str) {
+        $revert = array('%21'=>'!', '%2A'=>'*', '%27'=>"'", '%28'=>'(', '%29'=>')');
+        return strtr(rawurlencode($str), $revert);
+    }
+
+    public static function getEmailSuffix(): array|bool
+    {
+        $suffix = admin_setting('email_whitelist_suffix', Dict::EMAIL_WHITELIST_SUFFIX_DEFAULT);
+        if (!is_array($suffix)) {
+            return preg_split('/,/', $suffix);
+        }
+        return $suffix;
+    }
+    
+    /**
+     * convert the transfer_enable to GB
+     * @param float $transfer_enable
+     * @return float
+     */
+    public static function transferToGB(float $transfer_enable): float
+    {
+        return $transfer_enable / 1073741824;
+    }
+
+    /**
+     * 转义 Telegram Markdown 特殊字符
+     * @param string $text
+     * @return string
+     */
+    public static function escapeMarkdown(string $text): string
+    {
+        return str_replace(['_', '*', '`', '['], ['\_', '\*', '\`', '\['], $text);
+    }
+}

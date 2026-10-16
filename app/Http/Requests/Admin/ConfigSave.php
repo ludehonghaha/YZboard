@@ -1,0 +1,193 @@
+<?php
+
+namespace App\Http\Requests\Admin;
+
+use App\Services\DeviceIpExclusion;
+use App\Services\SubscriptionClientControl;
+use App\Support\AdminAppearance;
+use Illuminate\Contracts\Validation\Validator;
+use Illuminate\Foundation\Http\FormRequest;
+
+class ConfigSave extends FormRequest
+{
+    const RULES = [
+        // invite & commission
+        'invite_force' => '',
+        'invite_commission' => 'integer|nullable',
+        'invite_gen_limit' => 'integer|nullable',
+        'invite_never_expire' => '',
+        'commission_first_time_enable' => '',
+        'commission_auto_check_enable' => '',
+        'commission_withdraw_limit' => 'nullable|numeric',
+        'commission_withdraw_method' => 'nullable|array',
+        'withdraw_close_enable' => '',
+        'commission_distribution_enable' => '',
+        'commission_distribution_l1' => 'nullable|numeric',
+        'commission_distribution_l2' => 'nullable|numeric',
+        'commission_distribution_l3' => 'nullable|numeric',
+        // site
+        'logo' => 'nullable|url',
+        'force_https' => '',
+        'stop_register' => '',
+        'app_name' => '',
+        'app_description' => '',
+        'app_url' => 'nullable|url',
+        'subscribe_url' => 'nullable',
+        'try_out_enable' => '',
+        'try_out_plan_id' => 'integer',
+        'try_out_hour' => 'numeric',
+        'tos_url' => 'nullable|url',
+        'currency' => '',
+        'currency_symbol' => '',
+        'ticket_must_wait_reply' => '',
+        // subscribe
+        'plan_change_enable' => '',
+        'reset_traffic_method' => 'in:0,1,2,3,4',
+        'surplus_enable' => '',
+        'new_order_event_id' => '',
+        'renew_order_event_id' => '',
+        'change_order_event_id' => '',
+        'show_info_to_server_enable' => '',
+        'show_protocol_to_server_enable' => '',
+        'subscribe_path' => '',
+        'subscribe_client_control' => 'sometimes|array:mode,clients,exempt_group_ids|required_array_keys:mode,clients,exempt_group_ids',
+        'subscribe_client_control.mode' => 'in:off,whitelist,blacklist',
+        'subscribe_client_control.clients' => 'array|list|max:64',
+        'subscribe_client_control.clients.*' => 'array:name,enabled,keywords|required_array_keys:name,enabled,keywords',
+        'subscribe_client_control.clients.*.name' => 'required|string|max:80',
+        'subscribe_client_control.clients.*.enabled' => 'required|boolean',
+        'subscribe_client_control.clients.*.keywords' => 'required|array|list|min:1|max:32',
+        'subscribe_client_control.clients.*.keywords.*' => 'required|string|max:128',
+        'subscribe_client_control.exempt_group_ids' => 'array|list|max:1000',
+        'subscribe_client_control.exempt_group_ids.*' => 'integer|min:1|distinct|exists:v2_server_group,id',
+        // server
+        'server_token' => 'nullable|min:16',
+        'server_pull_interval' => 'integer',
+        'server_push_interval' => 'integer',
+        'device_limit_mode' => 'integer',
+        'server_ws_enable' => 'boolean',
+        'server_ws_url' => 'nullable|url',
+        'device_ip_exclude' => 'nullable|array',
+        'device_ip_exclude.*' => 'nullable|string|max:64',
+        // frontend
+        'admin_sidebar_hidden' => 'sometimes|array|list|max:24',
+        'frontend_theme' => '',
+        'frontend_theme_sidebar' => 'nullable|in:dark,light',
+        'frontend_theme_header' => 'nullable|in:dark,light',
+        'frontend_theme_color' => 'nullable|in:default,darkblue,black,green',
+        'frontend_background_url' => 'nullable|url',
+        // email
+        'email_host' => '',
+        'email_port' => '',
+        'email_username' => '',
+        'email_password' => '',
+        'email_encryption' => '',
+        'email_from_address' => '',
+        'remind_mail_enable' => '',
+        // telegram
+        'telegram_bot_enable' => '',
+        'telegram_bot_token' => '',
+        'telegram_webhook_url' => 'nullable|url',
+        'telegram_discuss_id' => '',
+        'telegram_channel_id' => '',
+        'telegram_discuss_link' => 'nullable|url',
+        // app
+        'windows_version' => '',
+        'windows_download_url' => '',
+        'macos_version' => '',
+        'macos_download_url' => '',
+        'android_version' => '',
+        'android_download_url' => '',
+        // safe
+        'email_whitelist_enable' => 'boolean',
+        'email_whitelist_suffix' => 'nullable|array',
+        'email_gmail_limit_enable' => 'boolean',
+        'captcha_enable' => 'boolean',
+        'captcha_type' => 'in:recaptcha,turnstile,recaptcha-v3',
+        'recaptcha_enable' => 'boolean',
+        'recaptcha_key' => '',
+        'recaptcha_site_key' => '',
+        'recaptcha_v3_secret_key' => '',
+        'recaptcha_v3_site_key' => '',
+        'recaptcha_v3_score_threshold' => 'numeric|min:0|max:1',
+        'turnstile_secret_key' => '',
+        'turnstile_site_key' => '',
+        'email_verify' => 'bool',
+        'safe_mode_enable' => 'boolean',
+        'register_limit_by_ip_enable' => 'boolean',
+        'register_limit_count' => 'integer',
+        'register_limit_expire' => 'integer',
+        'secure_path' => 'min:8|regex:/^[\w-]*$/',
+        'password_limit_enable' => 'boolean',
+        'password_limit_count' => 'integer',
+        'password_limit_expire' => 'integer',
+        'default_remind_expire' => 'boolean',
+        'default_remind_traffic' => 'boolean',
+        'subscribe_template_singbox' => 'nullable',
+        'subscribe_template_clash' => 'nullable',
+        'subscribe_template_clashmeta' => 'nullable',
+        'subscribe_template_stash' => 'nullable',
+        'subscribe_template_surge' => 'nullable',
+        'subscribe_template_surfboard' => 'nullable'
+    ];
+    /**
+     * Get the validation rules that apply to the request.
+     *
+     * @return array
+     */
+    public function rules()
+    {
+        return self::RULES + [
+            'admin_sidebar_hidden.*' => 'required|string|distinct|in:' . implode(',', AdminAppearance::ITEMS),
+        ];
+    }
+
+    /** 校验不计入设备数的来源名单，逐项给出错误。 */
+    public function withValidator(Validator $validator): void
+    {
+        $validator->after(function (Validator $validator) {
+            $entries = $this->input(DeviceIpExclusion::SETTING);
+            if (!is_array($entries)) {
+                return;
+            }
+            foreach (DeviceIpExclusion::parse($entries)[1] as $error) {
+                $validator->errors()->add(DeviceIpExclusion::SETTING, $error);
+            }
+        });
+    }
+
+    public function messages()
+    {
+        // illiteracy prompt
+        return [
+            'app_url.url' => '站点URL格式不正确，必须携带http(s)://',
+            'subscribe_url.url' => '订阅URL格式不正确，必须携带http(s)://',
+            'server_token.min' => '通讯密钥长度必须大于16位',
+            'tos_url.url' => '服务条款URL格式不正确，必须携带http(s)://',
+            'telegram_webhook_url.url' => 'Telegram Webhook地址格式不正确，必须携带http(s)://',
+            'telegram_discuss_link.url' => 'Telegram群组地址必须为URL格式，必须携带http(s)://',
+            'logo.url' => 'LOGO URL格式不正确，必须携带https(s)://',
+            'secure_path.min' => '后台路径长度最小为8位',
+            'secure_path.regex' => '后台路径只能为字母或数字',
+            'captcha_type.in' => '人机验证类型只能选择 recaptcha、turnstile 或 recaptcha-v3',
+            'recaptcha_v3_score_threshold.numeric' => 'reCAPTCHA v3 分数阈值必须为数字',
+            'recaptcha_v3_score_threshold.min' => 'reCAPTCHA v3 分数阈值不能小于0',
+            'recaptcha_v3_score_threshold.max' => 'reCAPTCHA v3 分数阈值不能大于1'
+        ];
+    }
+
+    public function attributes(): array
+    {
+        return [
+            SubscriptionClientControl::SETTING => '订阅客户端限制',
+            'subscribe_client_control.mode' => '限制模式',
+            'subscribe_client_control.clients' => '客户端名单',
+            'subscribe_client_control.clients.*.name' => '客户端名称',
+            'subscribe_client_control.clients.*.enabled' => '客户端选中状态',
+            'subscribe_client_control.clients.*.keywords' => '客户端匹配关键词',
+            'subscribe_client_control.clients.*.keywords.*' => '客户端匹配关键词',
+            'subscribe_client_control.exempt_group_ids' => '豁免权限组',
+            'subscribe_client_control.exempt_group_ids.*' => '豁免权限组',
+        ];
+    }
+}

@@ -1,0 +1,712 @@
+<?php
+
+namespace App\Services;
+
+use App\Models\Server;
+use App\Models\Setting;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+
+/**
+ * 中转拓扑服务。
+ *
+ * 约定：节点的前置入口非空时，该节点是“中转逻辑节点”，前置入口是客户端真实连接的入口。
+ * 逻辑节点自身的协议、地址、端口描述的是入口到落地服务器之间的内部链路，不会出现在用户订阅中。
+ * 当前只支持“一个真实入口 + 一层落地”，内部链路可使用 Shadowsocks、VLESS 或 WireGuard。
+ */
+class ServerRelayService
+{
+    /** 保留旧版 VLESS 入口常量；入口能力统一通过 isSupportedEntry 判断。 */
+    public const ENTRY_TYPE = Server::TYPE_VLESS;
+
+    /** 内部中转链路支持的加密算法。键为算法名，值为 SS2022 的密钥字节长度（传统算法为 null）。 */
+    private const TRANSIT_CIPHERS = [
+        '2022-blake3-aes-128-gcm' => 16,
+        '2022-blake3-aes-256-gcm' => 32,
+        '2022-blake3-chacha20-poly1305' => 32,
+        'aes-128-gcm' => null,
+        'aes-192-gcm' => null,
+        'aes-256-gcm' => null,
+        'chacha20-ietf-poly1305' => null,
+        'xchacha20-ietf-poly1305' => null,
+    ];
+
+    private const DEFAULT_TRANSIT_CIPHER = '2022-blake3-aes-128-gcm';
+
+    /** 与当前 YZ-Xray-core 对齐的 VLESS 传输名称。H2 已由核心移除，不在此兼容。 */
+    private const VLESS_NETWORKS = [
+        'tcp' => 'tcp',
+        'raw' => 'tcp',
+        'ws' => 'ws',
+        'websocket' => 'ws',
+        'grpc' => 'grpc',
+        'xhttp' => 'xhttp',
+        'splithttp' => 'xhttp',
+        'httpupgrade' => 'httpupgrade',
+        'kcp' => 'kcp',
+        'mkcp' => 'kcp',
+        'hysteria' => 'hysteria',
+    ];
+
+    /** Reality 在当前核心中只允许 RAW、XHTTP 和 gRPC。 */
+    private const REALITY_NETWORKS = ['tcp', 'xhttp', 'grpc'];
+
+    /**
+     * 内部中转出站/入站标签。标签必须稳定，落地节点的流量统计按标签回写到逻辑节点。
+     */
+    public static function outboundTag(int $childId): string
+    {
+        return "relay-{$childId}";
+    }
+
+    /**
+     * 从出站标签还原逻辑节点 ID，无法识别时返回 null。
+     */
+    public static function nodeIdFromOutboundTag(string $tag): ?int
+    {
+        if (!preg_match('/^relay-(\d+)$/', $tag, $matches)) {
+            return null;
+        }
+        $id = (int) $matches[1];
+        return $id > 0 ? $id : null;
+    }
+
+    public static function isSupportedTransitCipher(?string $cipher): bool
+    {
+        return $cipher !== null && array_key_exists($cipher, self::TRANSIT_CIPHERS);
+    }
+
+    public static function supportedTransitCiphers(): array
+    {
+        return array_keys(self::TRANSIT_CIPHERS);
+    }
+
+    /**
+     * 分配一个新的路由编号。
+     *
+     * 游标只增不减，因此删除节点后编号不会被立即复用。
+     */
+    public static function allocateRouteId(): int
+    {
+        $allocate = function (): int {
+            // 游标直接读写数据库，绕开 admin_setting 的全局缓存，避免读到过期值导致编号重复。
+            $cursor = (int) (Setting::where('name', Server::ROUTE_CURSOR_SETTING)->value('value') ?? 0);
+            $maxUsed = (int) Server::max('vless_route');
+            $next = max($cursor, $maxUsed, Server::ROUTE_ID_MIN - 1) + 1;
+
+            if ($next > Server::ROUTE_ID_MAX) {
+                $next = self::reclaimRouteId();
+            }
+
+            Setting::createOrUpdate(Server::ROUTE_CURSOR_SETTING, (string) min($next, Server::ROUTE_ID_MAX));
+
+            return $next;
+        };
+
+        $lock = Cache::lock('vless_route_allocate', 10);
+        if ($lock->get()) {
+            try {
+                return $allocate();
+            } finally {
+                $lock->release();
+            }
+        }
+
+        return $allocate();
+    }
+
+    /**
+     * 编号耗尽时回收一个未被占用的编号。找不到时抛出异常，避免静默产生重复编号。
+     */
+    private static function reclaimRouteId(): int
+    {
+        $used = Server::whereNotNull('vless_route')->pluck('vless_route')->all();
+        $used = array_flip(array_map('intval', $used));
+
+        for ($candidate = Server::ROUTE_ID_MIN; $candidate <= Server::ROUTE_ID_MAX; $candidate++) {
+            if (!isset($used[$candidate])) {
+                return $candidate;
+            }
+        }
+
+        throw new \RuntimeException('VLESS 路由编号已耗尽');
+    }
+
+    /**
+     * 确保节点拥有稳定的路由编号，返回该编号。
+     */
+    public static function ensureRouteId(Server $server): int
+    {
+        if ($server->vless_route !== null && $server->vless_route >= Server::ROUTE_ID_MIN) {
+            return (int) $server->vless_route;
+        }
+
+        $routeId = self::allocateRouteId();
+        $server->vless_route = $routeId;
+
+        // 直接落库，避免触发 Server 的观察者和订阅缓存失效逻辑。
+        DB::table('v2_server')->where('id', $server->id)->update(['vless_route' => $routeId]);
+
+        return $routeId;
+    }
+
+    /**
+     * 取得逻辑节点对应的真实入口节点；不是合法的中转逻辑节点时返回 null。
+     */
+    public static function entryFor(Server $child): ?Server
+    {
+        if (!self::isSupportedLanding($child)) {
+            return null;
+        }
+
+        $entry = $child->relayEntry;
+        if (!$entry || $entry->id === $child->id) {
+            return null;
+        }
+
+        if (!self::isSupportedEntry($entry)) {
+            return null;
+        }
+
+        return $entry;
+    }
+
+    /**
+     * 取得以该节点为入口、且处于启用状态的中转逻辑节点。
+     */
+    public static function childrenOf(Server $entry): Collection
+    {
+        if (!self::isSupportedEntry($entry)) {
+            return collect();
+        }
+
+        return Server::where('relay_entry_id', $entry->id)
+            ->whereIn('type', Server::RELAY_TRANSIT_TYPES)
+            ->where(function ($query) {
+                $query->where('enabled', true)->orWhereNull('enabled');
+            })
+            ->orderBy('sort', 'ASC')
+            ->get()
+            ->filter(fn(Server $child) => self::isSupportedLanding($child, $entry))
+            ->values();
+    }
+
+    public static function hasRelayChildren(Server $entry): bool
+    {
+        return self::childrenOf($entry)->isNotEmpty() || self::blockedWireGuardRoutes($entry) !== [];
+    }
+
+    /** 保留停用 WG 的编号，拒绝缓存订阅继续从前置直连出网。 */
+    public static function blockedWireGuardRoutes(Server $entry): array
+    {
+        if (!self::isSupportedEntry($entry)) {
+            return [];
+        }
+        return Server::where('relay_entry_id', $entry->id)->where('type', Server::TYPE_WIREGUARD)
+            ->where('enabled', false)->orderBy('id')->get()
+            ->map(fn (Server $child) => self::ensureRouteId($child))->all();
+    }
+
+    /** 入口按实际内核校验，且自身不能再连接其它前置入口。 */
+    public static function isSupportedEntry(Server $entry): bool
+    {
+        return $entry->relayEntryId() === null
+            && self::validateEntrySettings(
+                $entry->type,
+                (array) $entry->protocol_settings,
+                (string) $entry->host,
+                $entry->kernel_type,
+            ) === null;
+    }
+
+    /** 旧数据中的无效落地也不能进入订阅或入口配置。 */
+    private static function isSupportedLanding(Server $child, ?Server $entry = null): bool
+    {
+        $entry ??= $child->relayEntry;
+        return $child->isRelayChild()
+            && $entry !== null
+            && self::validateTransitSettings(
+                $child->type,
+                (array) $child->protocol_settings,
+                (string) $child->host,
+                $child->kernel_type,
+            ) === null
+            && self::validateTransitSettings(
+                $child->type,
+                (array) $child->protocol_settings,
+                (string) $child->host,
+                $entry->kernel_type,
+            ) === null;
+    }
+
+    /** 校验客户端入口协议；入口协议与入口到落地的内部协议分别校验。 */
+    public static function validateEntrySettings(?string $type, array $settings, ?string $host, ?string $kernelType = null): ?string
+    {
+        $type = Server::normalizeType($type);
+        if ($type === Server::TYPE_VLESS) {
+            return self::validateTransitSettings($type, $settings, $host, $kernelType);
+        }
+        if ($type !== Server::TYPE_HYSTERIA || (int) data_get($settings, 'version', 2) !== 2) {
+            return '前置入口必须是 VLESS 或 Hysteria2 节点';
+        }
+        if (data_get($settings, 'obfs.open')) {
+            if (data_get($settings, 'obfs.type') !== 'salamander') {
+                return 'Hysteria2 前置入口只支持 Salamander 混淆';
+            }
+            if (strlen((string) data_get($settings, 'obfs.password')) < 4) {
+                return 'Hysteria2 前置入口的混淆密码至少需要 4 字节';
+            }
+        }
+        if (data_get($settings, 'tls.ech.enabled')
+            && trim((string) data_get($settings, 'tls.ech.key')) === ''
+            && trim((string) data_get($settings, 'tls.ech.key_path')) === '') {
+            return 'Hysteria2 前置入口开启 ECH 时必须提供服务端密钥';
+        }
+        return null;
+    }
+
+    /**
+     * 生成入口与落地之间的内部认证信息。
+     *
+     * 由面板密钥派生，两端各自向面板拉取同一份结果，不写入数据库，也不下发给客户端。
+     */
+    public static function transitCredential(Server $child): array
+    {
+        $cipher = data_get($child->protocol_settings, 'cipher');
+        if (!self::isSupportedTransitCipher($cipher)) {
+            $cipher = self::DEFAULT_TRANSIT_CIPHER;
+        }
+
+        $material = hash_hmac(
+            'sha256',
+            implode('|', [
+                'xboard-relay-shadowsocks',
+                (string) $child->id,
+                (string) $child->relay_entry_id,
+                (string) $child->getRawOriginal('created_at'),
+            ]),
+            (string) config('app.key'),
+            true
+        );
+
+        $keySize = self::TRANSIT_CIPHERS[$cipher];
+        $password = $keySize === null
+            ? substr(bin2hex($material), 0, 32)
+            : base64_encode(substr($material, 0, $keySize));
+
+        return [
+            'cipher' => $cipher,
+            'password' => $password,
+        ];
+    }
+
+    /**
+     * 生成 VLESS 内部链路的稳定身份及传输认证信息。
+     *
+     * UUID 的路由字节固定为 0，避免内部链路身份意外携带面向客户端的 vlessRoute。
+     */
+    public static function vlessTransitCredential(Server $child): array
+    {
+        $material = self::deriveMaterial($child, 'xboard-relay-vless');
+        $bytes = substr($material, 0, 16);
+        $bytes[6] = "\x00";
+        $bytes[7] = "\x00";
+        $bytes[8] = chr((ord($bytes[8]) & 0x3f) | 0x80);
+        $hex = bin2hex($bytes);
+
+        return [
+            'id' => sprintf(
+                '%s-%s-%s-%s-%s',
+                substr($hex, 0, 8),
+                substr($hex, 8, 4),
+                substr($hex, 12, 4),
+                substr($hex, 16, 4),
+                substr($hex, 20, 12),
+            ),
+            // Hysteria 是传输层，这个认证值与 VLESS UUID 使用不同派生域。
+            'transport_auth' => rtrim(strtr(base64_encode(
+                self::deriveMaterial($child, 'xboard-relay-vless-hysteria')
+            ), '+/', '-_'), '='),
+        ];
+    }
+
+    /**
+     * 生成只供入口端使用的 VLESS 客户端配置。
+     *
+     * 这里采用白名单组装，Reality 私钥、VLESS decryption、证书和 ECH 私钥都不会下发给入口。
+     */
+    public static function vlessClientConfig(Server $child): array
+    {
+        $settings = (array) $child->protocol_settings;
+        $credential = self::vlessTransitCredential($child);
+        $network = self::normalizeVlessNetwork(data_get($settings, 'network')) ?? 'tcp';
+        $tls = (int) data_get($settings, 'tls', 0);
+        $flow = trim((string) data_get($settings, 'flow'));
+        if ($flow === 'none') {
+            $flow = '';
+        }
+
+        $config = [
+            'id' => $credential['id'],
+            'network' => $network,
+            'network_settings' => self::vlessClientNetworkSettings(
+                $network,
+                (array) data_get($settings, 'network_settings', []),
+            ),
+            'tls' => $tls,
+            'flow' => $flow,
+            'encryption' => data_get($settings, 'encryption.enabled')
+                ? trim((string) data_get($settings, 'encryption.encryption'))
+                : 'none',
+        ];
+
+        if ($network === 'hysteria') {
+            $config['transport_auth'] = $credential['transport_auth'];
+        }
+
+        if ($tls === 1) {
+            $config['tls_settings'] = array_filter([
+                'server_name' => trim((string) data_get($settings, 'tls_settings.server_name')),
+                'fingerprint' => self::tlsFingerprint($settings),
+            ], fn($value) => $value !== '');
+        } elseif ($tls === 2) {
+            $config['reality_settings'] = [
+                'server_name' => trim((string) data_get($settings, 'reality_settings.server_name')),
+                'public_key' => trim((string) data_get($settings, 'reality_settings.public_key')),
+                'short_id' => trim((string) data_get($settings, 'reality_settings.short_id')),
+                'fingerprint' => self::tlsFingerprint($settings) ?: 'chrome',
+            ];
+        }
+
+        return $config;
+    }
+
+    private static function deriveMaterial(Server $child, string $domain): string
+    {
+        return hash_hmac(
+            'sha256',
+            implode('|', [
+                $domain,
+                (string) $child->id,
+                (string) $child->relay_entry_id,
+                (string) $child->getRawOriginal('created_at'),
+            ]),
+            (string) config('app.key'),
+            true
+        );
+    }
+
+    private static function tlsFingerprint(array $settings): string
+    {
+        if (!data_get($settings, 'utls.enabled')) {
+            return '';
+        }
+
+        return trim((string) data_get($settings, 'utls.fingerprint', 'chrome')) ?: 'chrome';
+    }
+
+    /** 只复制传输客户端实际需要的字段，避免任意 extra 配置带出服务端私密字段。 */
+    private static function vlessClientNetworkSettings(string $network, array $settings): array
+    {
+        $keys = match ($network) {
+            'tcp' => ['header'],
+            'ws' => ['path', 'host', 'headers', 'heartbeatPeriod'],
+            'grpc' => ['serviceName', 'service_name', 'authority', 'multiMode', 'idle_timeout',
+                'health_check_timeout', 'permit_without_stream', 'initial_windows_size', 'user_agent'],
+            'httpupgrade' => ['path', 'host', 'headers'],
+            'xhttp' => ['path', 'host', 'mode', 'headers', 'extra'],
+            'kcp' => ['mtu', 'tti', 'uplinkCapacity', 'downlinkCapacity', 'cwndMultiplier', 'maxSendingWindow'],
+            'hysteria' => ['udpIdleTimeout'],
+            default => [],
+        };
+
+        $client = collect($settings)->only($keys)->all();
+        if ($network === 'xhttp' && isset($client['extra']) && is_array($client['extra'])) {
+            $client['extra'] = self::stripServerSecrets($client['extra']);
+        }
+
+        return $client;
+    }
+
+    /** 递归移除 XHTTP downloadSettings 中可能嵌入的服务端私密字段。 */
+    private static function stripServerSecrets(array $value): array
+    {
+        $blocked = [
+            'privatekey',
+            'decryption',
+            'certificates',
+            'echserverkeys',
+            'keycontent',
+        ];
+        $result = [];
+        foreach ($value as $key => $item) {
+            $normalized = strtolower(str_replace(['_', '-'], '', (string) $key));
+            if (in_array($normalized, $blocked, true)) {
+                continue;
+            }
+            $result[$key] = is_array($item) ? self::stripServerSecrets($item) : $item;
+        }
+
+        return $result;
+    }
+
+    public static function normalizeVlessNetwork(?string $network): ?string
+    {
+        $network = strtolower(trim((string) $network));
+        return self::VLESS_NETWORKS[$network] ?? null;
+    }
+
+    /** 校验协议自身是否能作为内部链路。合法时返回 null。 */
+    public static function validateTransitSettings(?string $type, array $settings, ?string $host, ?string $kernelType = null): ?string
+    {
+        $type = Server::normalizeType($type);
+        if ($type === Server::TYPE_WIREGUARD) {
+            $mtu = $settings['mtu'] ?? 1420;
+            $keepalive = $settings['keepalive'] ?? 25;
+            if (filter_var($mtu, FILTER_VALIDATE_INT) === false || $mtu < 1280 || $mtu > 1500) {
+                return 'WireGuard MTU 必须在 1280–1500 之间';
+            }
+            if (filter_var($keepalive, FILTER_VALIDATE_INT) === false || $keepalive < 0 || $keepalive > 65535) {
+                return 'WireGuard 保活间隔必须在 0–65535 秒之间';
+            }
+            return null;
+        }
+        if ($type === Server::TYPE_SHADOWSOCKS) {
+            $cipher = data_get($settings, 'cipher');
+            return self::isSupportedTransitCipher($cipher)
+                ? null
+                : '中转逻辑节点的加密算法不受支持，可选：' . implode('、', self::supportedTransitCiphers());
+        }
+
+        if ($type !== Server::TYPE_VLESS) {
+            return '中转逻辑节点只支持 Shadowsocks、VLESS 或 WireGuard 协议作为入口到落地之间的中转';
+        }
+
+        $rawNetwork = strtolower(trim((string) data_get($settings, 'network')));
+        // 兼容早期未显式保存 network 的 VLESS 节点；Xray 的默认传输即 RAW/TCP。
+        if ($rawNetwork === '') {
+            $rawNetwork = 'tcp';
+        }
+        if (in_array($rawNetwork, ['h2', 'http'], true)) {
+            return '当前 YZ-Xray-core 已移除 H2/HTTP 传输，请改用 XHTTP';
+        }
+        $network = self::normalizeVlessNetwork($rawNetwork);
+        if ($network === null) {
+            return 'VLESS 中转不支持该传输，可选：RAW/TCP、WS、gRPC、XHTTP、HTTPUpgrade、mKCP、Hysteria';
+        }
+
+        if (Server::effectiveKernelType($kernelType) === Server::KERNEL_SINGBOX) {
+            if (!in_array($network, ['tcp', 'ws', 'grpc', 'httpupgrade'], true)) {
+                return 'sing-box 中转的 VLESS 传输只支持 RAW/TCP、WS、gRPC、HTTPUpgrade';
+            }
+            if (data_get($settings, 'encryption.enabled')) {
+                return 'sing-box 中转暂不支持 VLESS Encryption';
+            }
+            if (data_get($settings, 'flow') === 'xtls-rprx-vision'
+                && ($network !== 'tcp' || (int) data_get($settings, 'tls', 0) === 0)) {
+                return 'sing-box 中转的 Vision 必须使用 RAW/TCP 和 TLS/Reality';
+            }
+            if ($network === 'tcp' && !in_array(data_get($settings, 'network_settings.header.type', 'none'), ['', 'none'], true)) {
+                return 'sing-box 中转不支持 TCP 头部伪装';
+            }
+        }
+
+        $tls = (int) data_get($settings, 'tls', 0);
+        if (!in_array($tls, [0, 1, 2], true)) {
+            return 'VLESS 中转的传输安全只能是无、TLS 或 Reality';
+        }
+        if ($tls === 2 && !in_array($network, self::REALITY_NETWORKS, true)) {
+            return 'Reality 仅支持 RAW/TCP、XHTTP 和 gRPC 传输';
+        }
+        if ($network === 'hysteria' && $tls !== 1) {
+            return 'Hysteria 传输必须启用 TLS，且不能使用 Reality';
+        }
+
+        $flow = trim((string) data_get($settings, 'flow'));
+        if (!in_array($flow, ['', 'none', 'xtls-rprx-vision'], true)) {
+            return '当前 YZ-Xray-core 的 VLESS Flow 只支持空值或 xtls-rprx-vision';
+        }
+
+        if (data_get($settings, 'tls_settings.ech.enabled')) {
+            return 'VLESS 中转暂不支持 ECH，请关闭 ECH 后再设置前置入口';
+        }
+        if ($tls === 1 && data_get($settings, 'tls_settings.allow_insecure')) {
+            return '当前 YZ-Xray-core 已移除 allowInsecure，VLESS 中转不能启用“允许不安全连接”';
+        }
+
+        if ($tls === 2) {
+            foreach (['server_name' => '伪装域名', 'public_key' => '公钥', 'private_key' => '私钥'] as $key => $label) {
+                if (trim((string) data_get($settings, "reality_settings.{$key}")) === '') {
+                    return "VLESS Reality 中转缺少{$label}";
+                }
+            }
+        }
+
+        $networkSettings = (array) data_get($settings, 'network_settings', []);
+        if ($network === 'kcp' && (array_key_exists('header', $networkSettings) || array_key_exists('seed', $networkSettings))) {
+            return '当前 YZ-Xray-core 已移除 mKCP header 和 seed，请删除后再使用';
+        }
+
+        $encryptionEnabled = (bool) data_get($settings, 'encryption.enabled', false);
+        if ($encryptionEnabled) {
+            if (!self::looksLikeVlessEncryption((string) data_get($settings, 'encryption.encryption'), false)
+                || !self::looksLikeVlessEncryption((string) data_get($settings, 'encryption.decryption'), true)) {
+                return 'VLESS Encryption 配置无效，请填写同一次 vlessenc 生成的 encryption 和 decryption';
+            }
+        } elseif ($tls === 0 && !self::isPrivateAddress((string) $host)) {
+            return '公网 VLESS 中转在未启用 TLS/Reality 时必须启用 VLESS Encryption';
+        }
+
+        return null;
+    }
+
+    private static function looksLikeVlessEncryption(string $value, bool $decryption): bool
+    {
+        $parts = explode('.', trim($value));
+        if (count($parts) < 4 || $parts[0] !== 'mlkem768x25519plus'
+            || !in_array($parts[1], ['native', 'xorpub', 'random'], true)) {
+            return false;
+        }
+
+        if (!$decryption && !in_array($parts[2], ['0rtt', '1rtt'], true)) {
+            return false;
+        }
+        if ($decryption && !preg_match('/^\d+(?:-\d+)?s$/', $parts[2])) {
+            return false;
+        }
+
+        $allowedKeyLengths = $decryption ? [32, 64] : [32, 1184];
+        $hasKey = false;
+        foreach (array_slice($parts, 3) as $part) {
+            // 短段是 Xray 支持的可选 padding；较长的段必须是合法密钥。
+            if (strlen($part) < 20) {
+                continue;
+            }
+
+            $decodedLength = self::base64UrlDecodedLength($part);
+            if ($decodedLength === null || !in_array($decodedLength, $allowedKeyLengths, true)) {
+                return false;
+            }
+            $hasKey = true;
+        }
+
+        return $hasKey;
+    }
+
+    private static function base64UrlDecodedLength(string $value): ?int
+    {
+        if (!preg_match('/^[A-Za-z0-9_-]+$/', $value) || strlen($value) % 4 === 1) {
+            return null;
+        }
+
+        $padding = (4 - strlen($value) % 4) % 4;
+        $decoded = base64_decode(strtr($value, '-_', '+/') . str_repeat('=', $padding), true);
+
+        return $decoded === false ? null : strlen($decoded);
+    }
+
+    private static function isPrivateAddress(string $host): bool
+    {
+        $host = trim($host, " \t\n\r\0\x0B[]");
+        if ($host === '' || strtolower($host) === 'localhost' || str_ends_with(strtolower($host), '.local')) {
+            return true;
+        }
+        if (!filter_var($host, FILTER_VALIDATE_IP)) {
+            return false;
+        }
+
+        return filter_var(
+            $host,
+            FILTER_VALIDATE_IP,
+            FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE,
+        ) === false;
+    }
+
+    /**
+     * 校验前置入口设置。返回错误信息，合法时返回 null。
+     *
+     * @param int|null $selfId 正在保存的节点 ID，新建时为 null
+     */
+    public static function validateEntry(
+        ?int $selfId,
+        ?int $entryId,
+        ?string $type,
+        array $protocolSettings = [],
+        ?string $host = null,
+        ?string $kernelType = null,
+    ): ?string
+    {
+        // 0 与 null 都表示“不使用中转”，管理端会把“无”提交为 0。
+        if (!$entryId) {
+            // 已被落地引用的入口必须保持支持路由编号的协议和内核。
+            if ($selfId !== null && Server::where('relay_entry_id', $selfId)->exists()) {
+                if ($error = self::validateEntrySettings($type, $protocolSettings, $host, $kernelType)) {
+                    return '该节点已被其它节点用作前置入口：' . $error;
+                }
+                foreach (Server::where('relay_entry_id', $selfId)->get() as $child) {
+                    if ($error = self::validateTransitSettings($child->type, (array) $child->protocol_settings, $child->host, $kernelType)) {
+                        return '该入口与已有落地不兼容：' . $error;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        if ($selfId !== null && $selfId === $entryId) {
+            return '前置入口不能是节点自身';
+        }
+
+        if ($error = self::validateTransitSettings($type, $protocolSettings, $host, $kernelType)) {
+            return $error;
+        }
+
+        $entry = Server::find($entryId);
+        if (!$entry) {
+            return '前置入口节点不存在';
+        }
+
+        if ($error = self::validateEntrySettings(
+            $entry->type,
+            (array) $entry->protocol_settings,
+            (string) $entry->host,
+            $entry->kernel_type,
+        )) {
+            return '前置入口配置无效：' . $error;
+        }
+
+        if ($error = self::validateTransitSettings($type, $protocolSettings, $host, $entry->kernel_type)) {
+            return '前置入口与落地不兼容：' . $error;
+        }
+
+        if ($entry->relayEntryId() !== null) {
+            return '不支持多层中转，入口节点自身不能再设置前置入口';
+        }
+
+        if ($selfId !== null && Server::where('relay_entry_id', $selfId)->exists()) {
+            return '该节点已经是其它节点的前置入口，不能再设置前置入口';
+        }
+
+        return null;
+    }
+
+    /** 每条链路独立派生两端密钥，只下发本端私钥和对端公钥，不进入订阅或数据库。 */
+    public static function wireGuardConfig(Server $child, bool $landing): array
+    {
+        $entryKey = self::deriveMaterial($child, 'yz-relay-wireguard-entry');
+        $landingKey = self::deriveMaterial($child, 'yz-relay-wireguard-landing');
+        $peerKey = $landing ? $entryKey : $landingKey;
+        $publicKey = \ParagonIE_Sodium_Compat::crypto_scalarmult_base($peerKey);
+
+        // 每个节点运行独立的用户态网络栈，地址不占用服务器接口或系统路由。
+        return [
+            'private_key' => base64_encode($landing ? $landingKey : $entryKey),
+            'peer_public_key' => base64_encode($publicKey),
+            'address' => $landing ? ['10.253.0.2/32', 'fd7a:797a::2/128'] : ['10.253.0.1/32', 'fd7a:797a::1/128'],
+            'allowed_ips' => $landing ? ['10.253.0.1/32', 'fd7a:797a::1/128'] : ['0.0.0.0/0', '::/0'],
+            'mtu' => (int) data_get($child->protocol_settings, 'mtu', 1420),
+            'keepalive' => $landing ? 0 : (int) data_get($child->protocol_settings, 'keepalive', 25),
+        ];
+    }
+}

@@ -1,0 +1,450 @@
+<?php
+
+namespace Tests\Feature;
+
+use App\Models\User;
+use App\Models\Server;
+use App\Services\InboundIpRecorder;
+use App\Services\InboundIpLocation;
+use App\Services\DeviceStateService;
+use App\Services\NodeStateService;
+use App\Services\RealtimeStateStore;
+use App\Services\QqwryLocation;
+use App\Services\ServerService;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Str;
+use Laravel\Sanctum\Sanctum;
+use Tests\TestCase;
+
+class InboundIpStatisticsTest extends TestCase
+{
+    use RefreshDatabase;
+    private bool $networkFails = false;
+    private array $externalProperties = [];
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        config(['app.timezone' => 'Asia/Shanghai']);
+        $this->travelTo(\Carbon\Carbon::parse('2026-10-07 15:00:00', 'Asia/Shanghai'));
+        Sanctum::actingAs($this->user(true));
+        $this->mock(QqwryLocation::class, function ($mock): void {
+            $mock->shouldReceive('lookup')->andReturnUsing(fn ($ip) => [
+                'region' => $ip === '8.8.8.8' ? '广东省广州市' : '浙江省杭州市',
+                'province' => $ip === '8.8.8.8' ? '广东省' : '浙江省',
+            ]);
+        });
+        Http::fake(['api.ip2location.io/*' => fn ($request) => $this->networkFails ? Http::response([], 429) : Http::response($this->externalProperties + ['ip' => $request->data()['ip'], 'asn' => 4134, 'as' => '测试网络',
+            'country_code' => 'CN', 'country_name' => 'China', 'region_name' => 'Guangdong', 'city_name' => 'Guangzhou'])]);
+    }
+
+    private function user(bool $admin = false): User
+    {
+        return User::create(['email' => Str::random(12) . '@example.test', 'password' => Str::random(32),
+            'uuid' => (string) Str::uuid(), 'token' => Str::random(32), 'is_admin' => $admin]);
+    }
+
+    public function test_properties_survive_cache_reload_and_expire_without_changing_observed_times(): void
+    {
+        $user = $this->user();
+        $this->record($user->id, ['8.8.8.8']);
+        // 模拟升级前已有有效的地区与 ASN，但尚未保存属性。
+        DB::table('v2_inbound_ip')->where('ip', '8.8.8.8')->update([
+            'external_expires_at' => now()->addDays(20)->timestamp, 'lookup_after' => 0,
+        ]);
+        $this->externalProperties = [
+            'isp' => '中国电信', 'usage_type' => 'ISP/MOB', 'is_proxy' => false, 'proxy' => ['is_vpn' => true, 'is_tor' => false],
+        ];
+        $url = $this->path('inboundUser', ['user_id' => $user->id]);
+        $first = $this->getJson($url)->assertOk()
+            ->assertJsonPath('data.list.0.ip_properties.isp', '中国电信')
+            ->assertJsonPath('data.list.0.ip_properties.usage_type', 'ISP/MOB')
+            ->assertJsonPath('data.list.0.ip_properties.is_proxy', false)
+            ->assertJsonPath('data.list.0.ip_properties.proxy.is_vpn', true)
+            ->assertJsonPath('data.list.0.ip_properties.proxy.is_tor', false)
+            ->assertJsonPath('data.list.0.ip_properties.proxy.is_botnet', null)
+            ->assertJsonPath('data.list.0.region', '广东省广州市');
+        Cache::flush();
+        $this->getJson($url)->assertOk()->assertJsonPath('data.list', $first->json('data.list'));
+        Http::assertSentCount(1);
+        DB::table('v2_inbound_ip')->where('ip', '8.8.8.8')->update([
+            'external_expires_at' => now()->subSecond()->timestamp, 'lookup_after' => now()->addMinutes(5)->timestamp,
+        ]);
+        $this->getJson($url)->assertOk()->assertJsonPath('data.list.0.ip_properties.usage_type', null)
+            ->assertJsonPath('data.list.0.ip_properties.isp', null)
+            ->assertJsonPath('data.list.0.ip_properties.proxy.is_vpn', null)
+            ->assertJsonPath('data.list.0.first_seen_at', $first->json('data.list.0.first_seen_at'));
+        Http::assertSentCount(1);
+        $this->travel(301)->seconds();
+        $this->networkFails = true;
+        $this->getJson($url)->assertOk()->assertJsonPath('data.list.0.ip_properties.is_proxy', null);
+        $this->getJson($url)->assertOk()->assertJsonPath('data.list.0.ip_properties.is_proxy', null);
+        Http::assertSentCount(2);
+    }
+
+    public function test_operator_uses_local_name_when_external_provider_is_missing(): void
+    {
+        $user = $this->user();
+        $this->record($user->id, ['8.8.8.8']);
+        $this->mock(\App\Services\DeviceIpLocationService::class, function ($mock): void {
+            $mock->shouldReceive('lookupMany')->once()->with(['8.8.8.8'])->andReturn(['8.8.8.8' => [
+                'asn' => 'AS64500', 'as_name' => '测试网络', 'isp' => '中国移动',
+                'region' => '广东省广州市', 'location_source' => 'local',
+            ]]);
+        });
+        $this->getJson($this->path('inboundUser', ['user_id' => $user->id]))->assertOk()
+            ->assertJsonPath('data.list.0.ip_properties.isp', '中国移动')
+            ->assertJsonPath('data.list.0.ip_properties.usage_type', null);
+    }
+
+    private function path(string $endpoint, array $params = []): string
+    {
+        return '/api/v2/' . hash('crc32b', config('app.key')) . '/statistics/' . $endpoint . '?' . http_build_query($params);
+    }
+
+    private function record(int $id, array $ips, ?int $at = null): void
+    {
+        app(InboundIpRecorder::class)->record([$id => $ips], $at);
+    }
+
+    public function test_repeated_out_of_order_and_cross_day_reports_preserve_observed_times(): void
+    {
+        $user = $this->user();
+        $now = now()->timestamp;
+        $this->record($user->id, ['8.8.8.8', '::ffff:8.8.8.8'], $now - 10);
+        $this->record($user->id, ['8.8.8.8'], $now);
+        $this->record($user->id, ['8.8.8.8'], $now - 20);
+        $this->record($user->id, ['8.8.8.8'], $now - 20);
+        $this->record($user->id, ['8.8.8.8'], now()->subDay()->timestamp);
+        $this->record($user->id, []);
+        $this->assertDatabaseCount('v2_stat_user_inbound_ip', 2);
+        $this->assertDatabaseHas('v2_stat_user_inbound_ip', ['user_id' => $user->id, 'record_at' => now()->startOfDay()->timestamp,
+            'first_seen_at' => $now - 20, 'last_seen_at' => $now]);
+        $this->getJson($this->path('inboundUsers'))->assertOk()->assertJsonPath('data.total', 1)
+            ->assertJsonPath('data.list.0.ip_count', 1)->assertJsonPath('data.meta.start_date', '2026-10-07');
+        $this->getJson($this->path('inboundUser', ['user_id' => $user->id, 'period' => '7d']))->assertOk()
+            ->assertJsonPath('data.list.0.first_seen_at', now()->subDay()->toIso8601String())
+            ->assertJsonPath('data.list.0.last_seen_at', now()->toIso8601String());
+    }
+
+    public function test_exclusions_apply_before_storage_and_before_counts_groups_and_pagination(): void
+    {
+        $user = $this->user();
+        admin_setting(['device_ip_exclude' => ['8.8.8.8']]);
+        $this->record($user->id, ['8.8.8.8', '1.1.1.1', '10.0.0.1', 'invalid', '2400:cb00:1:2::1', '2400:cb00:1:2::2']);
+        $this->assertDatabaseCount('v2_stat_user_inbound_ip', 3);
+        admin_setting(['device_ip_exclude' => ['1.1.1.0/24', '2400:cb00:1:2::1']]);
+        $result = $this->getJson($this->path('inboundUser', ['user_id' => $user->id, 'page_size' => 1]));
+        $result->assertOk()->assertJsonPath('data.total', 1)->assertJsonPath('data.ip_count', 1)
+            ->assertJsonPath('data.list.0.ip', '2400:cb00:1:2::2')->assertJsonPath('data.list.0.province', '广东省')
+            ->assertJsonPath('data.provinces.0.count', 1);
+        $this->getJson($this->path('inboundUsers'))->assertOk()->assertJsonPath('data.list.0.ip_count', 1);
+        admin_setting(['device_ip_exclude' => ['2400:cb00:1::/48', '1.1.1.0/24']]);
+        $this->getJson($this->path('inboundUsers'))->assertOk()->assertJsonPath('data.total', 0);
+        admin_setting(['device_ip_exclude' => []]);
+        $this->getJson($this->path('inboundUsers'))->assertOk()->assertJsonPath('data.list.0.ip_count', 3);
+    }
+
+    public function test_user_list_provinces_follow_dates_exclusions_and_user_pagination_without_external_queries(): void
+    {
+        $a = $this->user(); $b = $this->user();
+        $this->record($a->id, ['8.8.8.8']);
+        $this->record($a->id, ['8.8.8.8', '1.1.1.1', '2400:cb00:1:2::1'], now()->subDay()->timestamp);
+        $this->record($b->id, ['9.9.9.9', '1.0.0.1']);
+        DB::table('v2_inbound_ip')->where('ip_version', 6)->update(['province' => '广东省', 'region' => '旧地址',
+            'external_expires_at' => now()->subSecond()->timestamp, 'lookup_after' => now()->addHour()->timestamp]);
+
+        $this->getJson($this->path('inboundUsers', ['page_size' => 1]))->assertOk()
+            ->assertJsonPath('data.list.0.id', $b->id)->assertJsonPath('data.list.0.provinces', ['浙江省']);
+        $this->getJson($this->path('inboundUsers', ['page_size' => 1, 'page' => 2]))->assertOk()
+            ->assertJsonPath('data.list.0.id', $a->id)->assertJsonPath('data.list.0.ip_count', 1)
+            ->assertJsonPath('data.list.0.provinces', ['广东省']);
+        $response = $this->getJson($this->path('inboundUsers', ['period' => '7d', 'page_size' => 1]))->assertOk()
+            ->assertJsonPath('data.list.0.id', $a->id)->assertJsonPath('data.list.0.ip_count', 3);
+        $this->assertEqualsCanonicalizing(['广东省', '浙江省', '未知'], $response->json('data.list.0.provinces'));
+        admin_setting(['device_ip_exclude' => ['1.1.1.1', '2400:cb00:1:2::1']]);
+        $this->getJson($this->path('inboundUsers', ['period' => '7d', 'search' => $a->email]))->assertOk()
+            ->assertJsonPath('data.total', 1)->assertJsonPath('data.list.0.provinces', ['广东省']);
+        DB::table('v2_inbound_ip')->where('ip', '8.8.8.8')->update(['province' => '上海市']);
+        $this->getJson($this->path('inboundUsers', ['search' => $a->email]))->assertOk()
+            ->assertJsonPath('data.list.0.provinces', ['上海市']);
+        $this->getJson($this->path('inboundUsers', ['search' => '不存在']))->assertOk()->assertJsonPath('data.list', []);
+        Http::assertNothingSent();
+    }
+
+    public function test_location_sources_province_filter_and_thirty_day_cache(): void
+    {
+        $user = $this->user();
+        $this->record($user->id, ['8.8.8.8', '1.1.1.1', '2400:cb00:1:2::1']);
+        $this->getJson($this->path('inboundUser', ['user_id' => $user->id, 'province' => '广东省']))->assertOk()
+            ->assertJsonPath('data.total', 2)->assertJsonPath('data.ip_count', 3);
+        $this->assertDatabaseHas('v2_inbound_ip', ['ip' => '8.8.8.8', 'region' => '广东省广州市', 'asn' => 'AS4134']);
+        $this->assertDatabaseHas('v2_inbound_ip', ['ip' => '2400:cb00:1:2::1', 'region' => 'China Guangdong Guangzhou', 'province' => '广东省']);
+        Http::assertSentCount(3);
+        $this->travel(29)->days();
+        app(InboundIpLocation::class)->refresh(['8.8.8.8', '1.1.1.1', '2400:cb00:1:2::1']);
+        Http::assertSentCount(3);
+        $this->travel(1)->days();
+        app(InboundIpLocation::class)->refresh(['8.8.8.8']);
+        Http::assertSentCount(4);
+    }
+
+    public function test_ip_search_finds_users_before_pagination_and_preserves_their_complete_counts(): void
+    {
+        $a = $this->user(); $b = $this->user(); $old = $this->user();
+        $this->record($a->id, ['8.8.8.8', '1.1.1.1', '2400:cb00:1:2::1']);
+        $this->record($a->id, ['8.8.8.8'], now()->subDay()->timestamp);
+        $this->record($b->id, ['8.8.8.8']);
+        $this->record($old->id, ['8.8.8.8'], now()->subDay()->timestamp);
+        foreach (['8.8.8.8', '8.8.'] as $search) {
+            $response = $this->getJson($this->path('inboundUsers', ['search' => $search, 'page_size' => 1]))->assertOk()
+                ->assertJsonPath('data.total', 2)->assertJsonPath('data.last_page', 2)
+                ->assertJsonPath('data.list.0.id', $a->id)->assertJsonPath('data.list.0.ip_count', 3);
+            $this->assertEqualsCanonicalizing(['广东省', '浙江省', '未知'], $response->json('data.list.0.provinces'));
+            $this->getJson($this->path('inboundUsers', ['search' => $search, 'page_size' => 1, 'page' => 2]))->assertOk()
+                ->assertJsonPath('data.list.0.id', $b->id)->assertJsonPath('data.list.0.ip_count', 1);
+        }
+        $b->delete();
+        $this->getJson($this->path('inboundUsers', ['search' => '8.8.8.8', 'page_size' => 1, 'page' => 2]))->assertOk()
+            ->assertJsonPath('data.list.0.name', '#' . $b->id);
+        $this->getJson($this->path('inboundUsers', ['search' => '8.8.8.8', 'period' => '7d']))->assertOk()
+            ->assertJsonPath('data.total', 3)->assertJsonPath('data.list.0.ip_count', 3);
+        admin_setting(['device_ip_exclude' => ['8.8.8.8']]);
+        $this->getJson($this->path('inboundUsers', ['search' => '8.8.8.8', 'period' => '7d']))->assertOk()
+            ->assertJsonPath('data.total', 0);
+        $this->getJson($this->path('inboundUsers', ['search' => $a->email]))->assertOk()
+            ->assertJsonPath('data.list.0.ip_count', 2);
+        Http::assertNothingSent();
+    }
+
+    public function test_ip_search_normalizes_complete_addresses_and_treats_wildcards_literally(): void
+    {
+        $user = $this->user();
+        $user->update(['email' => 'ip-search@example.test']);
+        $this->record($user->id, ['8.8.8.8', '2400:cb00:1:2::1', '2400:cb00:1:2::2']);
+        foreach (['2400:CB00:1:2' => 2, '2400:cb00:0001:0002:0000:0000:0000:0001' => 1, '::ffff:8.8.8.8' => 1] as $search => $count) {
+            $this->getJson($this->path('inboundUsers', ['search' => $search]))->assertOk()
+                ->assertJsonPath('data.total', 1)->assertJsonPath('data.list.0.ip_count', 3);
+            $this->getJson($this->path('inboundUser', ['user_id' => $user->id, 'search' => $search]))->assertOk()
+                ->assertJsonPath('data.total', $count)->assertJsonPath('data.ip_count', 3);
+        }
+        foreach (['%', '_', '!', "8.8.8.8' OR 1=1 --"] as $search) {
+            $this->getJson($this->path('inboundUsers', ['search' => $search]))->assertOk()->assertJsonPath('data.total', 0);
+            $this->getJson($this->path('inboundUser', ['user_id' => $user->id, 'search' => $search]))->assertOk()
+                ->assertJsonPath('data.total', 0)->assertJsonPath('data.ip_count', 3);
+        }
+    }
+
+    public function test_detail_ip_search_combines_with_province_and_preserves_groups_across_reload_and_clear(): void
+    {
+        $user = $this->user();
+        $this->record($user->id, ['8.8.8.8', '1.1.1.1', '2400:cb00:1:2::1', '2400:cb00:1:2::2']);
+        $params = ['user_id' => $user->id, 'search' => '2400:cb00', 'province' => '广东省', 'page_size' => 1, 'page' => 2];
+        foreach ([1, 2] as $attempt) {
+            $response = $this->getJson($this->path('inboundUser', $params))->assertOk()
+                ->assertJsonPath('data.total', 2)->assertJsonPath('data.ip_count', 4)->assertJsonPath('data.last_page', 2)
+                ->assertJsonPath('data.list.0.ip', '2400:cb00:1:2::2');
+            $this->assertEquals(['广东省' => 3, '浙江省' => 1], array_column($response->json('data.provinces'), 'count', 'name'));
+        }
+        $this->getJson($this->path('inboundUser', array_replace($params, ['province' => '浙江省'])))->assertOk()
+            ->assertJsonPath('data.total', 0)->assertJsonPath('data.ip_count', 4)->assertJsonPath('data.page', 1);
+        $this->getJson($this->path('inboundUser', ['user_id' => $user->id]))->assertOk()->assertJsonPath('data.total', 4);
+        $this->getJson($this->path('inboundUser', ['user_id' => $user->id, 'search' => str_repeat('1', 101)]))->assertUnprocessable();
+    }
+
+    public function test_upgrade_refreshes_unknown_ipv4_provinces_without_changing_other_cached_data(): void
+    {
+        $user = $this->user();
+        $this->record($user->id, ['8.8.8.8', '1.1.1.1', '9.9.9.9', '2400:cb00:1:2::1']);
+        $expires = now()->addDays(30)->timestamp;
+        DB::table('v2_inbound_ip')->update(['local_expires_at' => $expires,
+            'external_expires_at' => $expires, 'lookup_after' => $expires,
+            'asn' => 'AS64500', 'as_name' => '测试网络']);
+        DB::table('v2_inbound_ip')->where('ip', '8.8.8.8')->update(['region' => '中国–上海–上海–宝山区 测试网络']);
+        DB::table('v2_inbound_ip')->where('ip', '1.1.1.1')->update(['region' => '浙江省杭州市', 'province' => '浙江省']);
+        DB::table('v2_inbound_ip')->where('ip_version', 6)->update(['region' => 'China Unknown']);
+        $before = DB::table('v2_inbound_ip')->orderBy('ip')->get()->keyBy('ip')->toArray();
+        $history = DB::table('v2_stat_user_inbound_ip')->orderBy('ip')->get()->toArray();
+        $migration = require database_path('migrations/2026_10_08_000001_refresh_unknown_inbound_ip_provinces.php');
+        $migration->up();
+        $migration->up();
+        $expected = unserialize(serialize($before));
+        $expected['8.8.8.8']->local_expires_at = 0;
+        $this->assertEquals($expected, DB::table('v2_inbound_ip')->orderBy('ip')->get()->keyBy('ip')->toArray());
+
+        $this->mock(QqwryLocation::class, function ($mock): void {
+            $mock->shouldReceive('lookup')->once()->with('8.8.8.8')->andReturn([
+                'region' => '中国–上海–上海–宝山区 测试网络',
+                'province' => \App\Services\IpProvince::fromChinese('中国–上海–上海–宝山区'),
+            ]);
+        });
+        foreach ([1, 2] as $attempt) {
+            $response = $this->getJson($this->path('inboundUsers'))->assertOk()
+                ->assertJsonPath('data.list.0.ip_count', 4);
+            $this->assertEqualsCanonicalizing(['上海市', '浙江省', '未知'], $response->json('data.list.0.provinces'));
+            $this->getJson($this->path('inboundUser', ['user_id' => $user->id, 'province' => '上海市']))->assertOk()
+                ->assertJsonPath('data.total', 1)->assertJsonPath('data.list.0.ip', '8.8.8.8')
+                ->assertJsonPath('data.list.0.province', '上海市')
+                ->assertJsonPath('data.list.0.region', '中国–上海–上海–宝山区 测试网络');
+        }
+        $migration->down();
+        $expected['8.8.8.8']->province = '上海市';
+        $expected['8.8.8.8']->local_expires_at = $expires;
+        $this->assertEquals($expected, DB::table('v2_inbound_ip')->orderBy('ip')->get()->keyBy('ip')->toArray());
+        $this->assertEquals($history, DB::table('v2_stat_user_inbound_ip')->orderBy('ip')->get()->toArray());
+        Http::assertNothingSent();
+    }
+
+    public function test_lookup_failure_keeps_ipv4_local_and_expired_ipv6_becomes_unknown(): void
+    {
+        $user = $this->user();
+        $this->record($user->id, ['8.8.8.8', '2400:cb00:1:2::1']);
+        $this->networkFails = true;
+        $this->getJson($this->path('inboundUser', ['user_id' => $user->id]))->assertOk()->assertJsonPath('data.total', 2);
+        $this->assertDatabaseHas('v2_inbound_ip', ['ip' => '8.8.8.8', 'region' => '广东省广州市', 'asn' => null]);
+        $this->assertDatabaseHas('v2_inbound_ip', ['ip' => '2400:cb00:1:2::1', 'region' => '未知', 'asn' => null]);
+        $sent = count(Http::recorded());
+        $this->getJson($this->path('inboundUser', ['user_id' => $user->id]))->assertOk();
+        Http::assertSentCount($sent);
+    }
+
+    public function test_retention_cleanup_validation_deleted_users_and_literal_search(): void
+    {
+        $user = $this->user();
+        $user->update(['email' => 'test_percent_%@example.test']);
+        $this->record($user->id, ['8.8.8.8'], now()->startOfDay()->subDays(29)->timestamp);
+        $this->record($user->id, ['1.1.1.1'], now()->startOfDay()->subDays(30)->timestamp);
+        $this->assertDatabaseCount('v2_stat_user_inbound_ip', 1);
+        $this->getJson($this->path('inboundUsers'))->assertOk()->assertJsonPath('data.total', 0);
+        $this->getJson($this->path('inboundUsers', ['period' => '30d', 'search' => '%']))->assertOk()->assertJsonPath('data.total', 1);
+        foreach ([['period' => 'custom', 'start_date' => '2026-09-07', 'end_date' => '2026-10-07'],
+            ['page_size' => 101], ['period' => '24h'], ['start_time' => '12:00']] as $params) {
+            $this->getJson($this->path('inboundUsers', $params))->assertUnprocessable();
+        }
+        $user->delete();
+        $this->getJson($this->path('inboundUsers', ['period' => '30d']))->assertOk()->assertJsonPath('data.list.0.name', '#' . $user->id);
+        $this->travel(1)->days();
+        $this->artisan('reset:log')->assertSuccessful();
+        $this->assertDatabaseCount('v2_stat_user_inbound_ip', 0);
+        $this->assertDatabaseCount('v2_inbound_ip', 0);
+    }
+
+    public function test_database_failure_rolls_back_addresses_and_retry_recovers(): void
+    {
+        $user = $this->user();
+        $this->failNextQueryMatching('/^insert\b.*\bv2_stat_user_inbound_ip\b/i');
+        try {
+            $this->record($user->id, ['8.8.8.8']);
+            $this->fail('应当报告写入失败');
+        } catch (\Illuminate\Database\QueryException) {
+            $this->assertDatabaseCount('v2_inbound_ip', 0);
+        }
+        $this->record($user->id, ['8.8.8.8']);
+        $this->assertDatabaseCount('v2_stat_user_inbound_ip', 1);
+    }
+
+    public function test_http_alive_and_realtime_projection_record_original_receipt_time_once(): void
+    {
+        $user = $this->user();
+        $this->mock(DeviceStateService::class, fn ($mock) => $mock->shouldReceive('replaceNodeDevices')->twice());
+        ServerService::processAlive(1, [$user->id => ['1.1.1.1']]);
+        $node = Server::create(['name' => '测试入口', 'type' => 'vless', 'host' => 'example.test', 'port' => 443,
+            'server_port' => 443, 'rate' => 1, 'group_ids' => [], 'enabled' => true]);
+        $store = app(RealtimeStateStore::class);
+        $session = $store->begin('node:' . $node->id, bin2hex(random_bytes(16)));
+        $store->accept('node:' . $node->id, $session['epoch'], 1, ['alive' => [$user->id => ['8.8.8.8']]]);
+        $received = now()->timestamp;
+        $this->travel(10)->seconds();
+        app(NodeStateService::class)->projectLatest($node);
+        $this->travel(5)->seconds();
+        app(NodeStateService::class)->projectLatest($node);
+        $this->assertDatabaseHas('v2_stat_user_inbound_ip', ['ip' => '8.8.8.8', 'first_seen_at' => $received, 'last_seen_at' => $received]);
+        $this->assertDatabaseCount('v2_stat_user_inbound_ip', 2);
+    }
+
+    public function test_non_admin_cannot_read_inbound_history(): void
+    {
+        Sanctum::actingAs($this->user());
+        $this->getJson($this->path('inboundUsers'))->assertForbidden();
+        $this->getJson($this->path('inboundUser', ['user_id' => 1]))->assertForbidden();
+    }
+
+    public function test_province_filter_classifies_all_local_batches_before_pagination(): void
+    {
+        $user = $this->user();
+        $ips = array_map(fn ($index) => '11.0.' . intdiv($index, 256) . '.' . ($index % 256), range(1, 270));
+        $this->record($user->id, $ips);
+        $this->getJson($this->path('inboundUsers'))->assertOk()->assertJsonPath('data.list.0.provinces', ['浙江省']);
+        $this->assertSame(270, DB::table('v2_inbound_ip')->where('province', '浙江省')->count());
+        Http::assertNothingSent();
+        $this->getJson($this->path('inboundUser', ['user_id' => $user->id, 'province' => '浙江省', 'page_size' => 100, 'page' => 3]))
+            ->assertOk()->assertJsonPath('data.total', 270)->assertJsonCount(70, 'data.list')->assertJsonPath('data.last_page', 3);
+        $this->assertSame(270, DB::table('v2_inbound_ip')->where('province', '浙江省')->count());
+        Http::assertSentCount(32);
+    }
+
+    public function test_background_lookup_excludes_front_addresses_and_shares_cache_after_reload(): void
+    {
+        $user = $this->user();
+        $this->record($user->id, ['8.8.8.8', '1.1.1.1']);
+        admin_setting(['device_ip_exclude' => ['1.1.1.1']]);
+        Http::fake(['www.ip2location.io/*' => Http::response(file_get_contents(base_path('tests/Fixtures/ip2location-web.html')), 200)]);
+        $this->artisan('inbound-ip:refresh')->assertSuccessful();
+        $this->assertDatabaseHas('v2_inbound_ip', ['ip' => '8.8.8.8', 'asn' => 'AS4134']);
+        $this->assertDatabaseHas('v2_inbound_ip', ['ip' => '1.1.1.1', 'asn' => null]);
+        Http::assertSentCount(2);
+        DB::table('v2_inbound_ip')->where('ip', '8.8.8.8')->update(['external_expires_at' => 0, 'lookup_after' => 0]);
+        $this->artisan('inbound-ip:refresh')->assertSuccessful();
+        Http::assertSentCount(2);
+        $this->assertSame(now()->addDays(30)->timestamp, (int) DB::table('v2_inbound_ip')->where('ip', '8.8.8.8')->value('external_expires_at'));
+    }
+
+    public function test_expired_ipv6_is_not_grouped_under_an_old_province_during_backoff(): void
+    {
+        $user = $this->user();
+        $this->record($user->id, ['2400:cb00:1:2::1']);
+        DB::table('v2_inbound_ip')->update(['region' => '旧地址', 'province' => '广东省', 'asn' => 'AS4134',
+            'external_expires_at' => now()->subSecond()->timestamp, 'lookup_after' => now()->addMinutes(5)->timestamp]);
+        $this->getJson($this->path('inboundUser', ['user_id' => $user->id]))->assertOk()
+            ->assertJsonPath('data.list.0.region', '未知')->assertJsonPath('data.list.0.asn', null)
+            ->assertJsonPath('data.provinces.0.name', '未知');
+        $this->getJson($this->path('inboundUser', ['user_id' => $user->id, 'province' => '广东省']))->assertOk()
+            ->assertJsonPath('data.total', 0);
+        Http::assertNothingSent();
+    }
+
+    public function test_province_groups_merge_final_classifications_and_deduplicate_across_days(): void
+    {
+        $user = $this->user();
+        $ips = ['8.8.8.8', '1.1.1.1', '9.9.9.9', '2400:cb00:1:2::1',
+            '2400:cb00:1:2::2', '2400:cb00:1:2::3', '2400:cb00:1:2::4'];
+        $this->record($user->id, $ips);
+        $this->record($user->id, $ips, now()->subDay()->timestamp);
+        DB::table('v2_inbound_ip')->update(['province' => '广东省', 'region' => '广东省广州市',
+            'local_expires_at' => now()->addDay()->timestamp, 'lookup_after' => now()->addDay()->timestamp,
+            'external_expires_at' => now()->addDay()->timestamp]);
+        DB::table('v2_inbound_ip')->whereIn('ip', ['1.1.1.1', '2400:cb00:1:2::2', '2400:cb00:1:2::3'])
+            ->update(['external_expires_at' => now()->subSecond()->timestamp]);
+        DB::table('v2_inbound_ip')->where('ip', '2400:cb00:1:2::3')->update(['province' => '浙江省']);
+        DB::table('v2_inbound_ip')->whereIn('ip', ['9.9.9.9', '2400:cb00:1:2::4'])->update(['province' => '未知']);
+
+        $params = ['user_id' => $user->id, 'period' => '7d', 'page_size' => 2];
+        $response = $this->getJson($this->path('inboundUser', $params))->assertOk()
+            ->assertJsonPath('data.total', 7)->assertJsonPath('data.ip_count', 7)->assertJsonCount(2, 'data.list');
+        $groups = array_column($response->json('data.provinces'), 'count', 'name');
+        $this->assertEquals(['广东省' => 3, '未知' => 4], $groups);
+        $filtered = $this->getJson($this->path('inboundUser', $params + ['province' => '未知', 'page' => 2]))
+            ->assertOk()->assertJsonPath('data.total', 4)->assertJsonPath('data.ip_count', 7)
+            ->assertJsonPath('data.last_page', 2)->assertJsonCount(2, 'data.list');
+        $this->assertEquals($groups, array_column($filtered->json('data.provinces'), 'count', 'name'));
+        foreach ($filtered->json('data.list') as $row) {
+            $this->assertSame('未知', $row['province']);
+        }
+        $this->getJson($this->path('inboundUser', ['user_id' => $this->user()->id]))->assertOk()
+            ->assertJsonPath('data.total', 0)->assertJsonPath('data.ip_count', 0)->assertJsonCount(0, 'data.provinces');
+        Http::assertNothingSent();
+    }
+}

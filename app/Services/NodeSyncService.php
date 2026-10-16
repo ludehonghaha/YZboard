@@ -1,0 +1,240 @@
+<?php
+
+namespace App\Services;
+
+use App\Models\Server;
+use App\Models\ServerMachine;
+use App\Models\User;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Redis;
+
+class NodeSyncService
+{
+    /**
+     * Check if node has active WS connection
+     */
+    public static function isNodeOnline(int $nodeId): bool
+    {
+        return (bool) Cache::get("node_ws_alive:{$nodeId}");
+    }
+
+    /**
+     * Push node config update
+     */
+    public static function notifyConfigUpdated(int $nodeId): void
+    {
+        if (!self::isNodeOnline($nodeId))
+            return;
+
+        $node = Server::find($nodeId);
+        if (!$node)
+            return;
+
+        self::push($nodeId, 'sync.config', ['config' => ServerService::buildNodeConfig($node)]);
+    }
+
+    /**
+     * 全局设置影响所有节点配置时，向全部在线节点推送最新配置。
+     */
+    public static function notifyAllConfigUpdated(): void
+    {
+        foreach (Server::query()->pluck('id') as $nodeId) {
+            self::notifyConfigUpdated((int) $nodeId);
+        }
+    }
+
+    /**
+     * Push all users to all nodes in the group
+     */
+    public static function notifyUsersUpdatedByGroup(int $groupId): void
+    {
+        self::notifyUsersUpdatedByGroups([$groupId]);
+    }
+
+    /**
+     * @param int[] $groupIds
+     */
+    public static function notifyUsersUpdatedByGroups(array $groupIds): void
+    {
+        foreach (self::serversInGroups($groupIds) as $server) {
+            if (!self::isNodeOnline($server->id)) continue;
+            self::push($server->id, 'sync.users', [
+                'users' => ServerService::getAvailableUsers($server)->toArray(),
+            ]);
+        }
+    }
+
+    /**
+     * Push user changes (add/remove) to affected nodes
+     */
+    public static function notifyUserChanged(User $user): void
+    {
+        $groupIds = $user->effectiveGroupIds();
+        if ($groupIds === [])
+            return;
+
+        $servers = self::serversInGroups($groupIds);
+        foreach ($servers as $server) {
+            // 落地只使用内部中转凭据，不接收普通用户增量。
+            if ($server->isRelayChild())
+                continue;
+
+            if (!self::isNodeOnline($server->id))
+                continue;
+
+            if (ServerRelayService::hasRelayChildren($server) || $server->type === Server::TYPE_WIREGUARD) {
+                self::push($server->id, 'sync.users', ['users' => ServerService::getAvailableUsers($server)->toArray()]);
+                continue;
+            }
+
+            if ($user->isAvailable()) {
+                self::push($server->id, 'sync.user.delta', [
+                    'action' => 'add',
+                    'users' => [
+                        [
+                            'id' => $user->id,
+                            'uuid' => $user->uuid,
+                            'speed_limit' => $user->speed_limit,
+                            'device_limit' => $user->device_limit,
+                            'conn_limit' => $user->conn_limit,
+                            'conn_rate_limit' => $user->conn_rate_limit,
+                        ]
+                    ],
+                ]);
+            } else {
+                self::push($server->id, 'sync.user.delta', [
+                    'action' => 'remove',
+                    'users' => [['id' => $user->id]],
+                ]);
+            }
+        }
+    }
+
+    /**
+     * Push user removal from a specific group's nodes
+     */
+    public static function notifyUserRemovedFromGroup(int $userId, int $groupId): void
+    {
+        self::notifyUserRemovedFromGroups($userId, [$groupId]);
+    }
+
+    public static function notifyUserRemovedFromGroups(int $userId, array $groupIds): void
+    {
+        $servers = self::serversInGroups($groupIds);
+
+        foreach ($servers as $server) {
+            if ($server->isRelayChild())
+                continue;
+
+            if (!self::isNodeOnline($server->id))
+                continue;
+
+            // 旧组撤权可能只移除一条线路，不能误删该用户仍有权使用的其他线路。
+            if (ServerRelayService::hasRelayChildren($server) || $server->type === Server::TYPE_WIREGUARD) {
+                self::push($server->id, 'sync.users', ['users' => ServerService::getAvailableUsers($server)->toArray()]);
+                continue;
+            }
+
+            self::push($server->id, 'sync.user.delta', [
+                'action' => 'remove',
+                'users' => [['id' => $userId]],
+            ]);
+        }
+    }
+
+    private static function serversInGroups(array $groupIds)
+    {
+        if (array_filter($groupIds, fn ($id) => (int) $id > 0) === []) {
+            return collect();
+        }
+        $servers = Server::where(function ($query) use ($groupIds) {
+            foreach (array_unique(array_filter(array_map('intval', $groupIds))) as $groupId) {
+                $query->orWhereJsonContains('group_ids', (string) $groupId)
+                    ->orWhereJsonContains('group_ids', (int) $groupId);
+            }
+        })->get();
+        // 落地不保存面板用户，线路权限变化必须通知承载认证的前置入口。
+        $entryIds = $servers->pluck('relay_entry_id')->filter()->unique();
+        return $servers->concat(Server::whereIn('id', $entryIds)->get())->unique('id')->values();
+    }
+
+    /**
+     * Full sync: push config + users to a node
+     */
+    public static function notifyFullSync(int $nodeId): void
+    {
+        if (!self::isNodeOnline($nodeId))
+            return;
+
+        $node = Server::find($nodeId);
+        if (!$node)
+            return;
+
+        self::push($nodeId, 'sync.config', ['config' => ServerService::buildNodeConfig($node)]);
+
+        $users = ServerService::getAvailableUsers($node)->toArray();
+        self::push($nodeId, 'sync.users', ['users' => $users]);
+    }
+
+    /**
+     * Notify machine that its node set has changed.
+     * Always publishes via Redis so the WS process can update its in-memory registry.
+     */
+    public static function notifyMachineNodesChanged(int $machineId): void
+    {
+        $machine = ServerMachine::find($machineId);
+
+        $nodeList = [];
+        if ($machine) {
+            $nodes = ServerService::getMachineNodes($machine);
+            $nodeList = $nodes->map(fn($n) => [
+                'id' => $n->id,
+                'type' => $n->type,
+                'name' => $n->name,
+                'kernel_type' => Server::effectiveKernelType($n->kernel_type),
+            ])->values()->toArray();
+        }
+
+        // Always publish via Redis so the WS process can update its in-memory registry
+        self::pushMachine($machineId, 'sync.nodes', ['nodes' => $nodeList]);
+    }
+
+    /**
+     * Publish a push command to Redis — picked up by the Workerman WS server
+     */
+    public static function push(int $nodeId, string $event, array $data): void
+    {
+        try {
+            Redis::publish('node:push', json_encode([
+                'node_id' => $nodeId,
+                'event' => $event,
+                'data' => $data,
+            ]));
+        } catch (\Throwable $e) {
+            Log::warning("[NodePush] Redis publish failed: {$e->getMessage()}", [
+                'node_id' => $nodeId,
+                'event' => $event,
+            ]);
+        }
+    }
+
+    /**
+     * Publish a machine-level push command to Redis — picked up by the Workerman WS server
+     */
+    public static function pushMachine(int $machineId, string $event, array $data): void
+    {
+        try {
+            Redis::publish('node:push', json_encode([
+                'machine_id' => $machineId,
+                'event' => $event,
+                'data' => $data,
+            ]));
+        } catch (\Throwable $e) {
+            Log::warning("[NodePush] Redis machine publish failed: {$e->getMessage()}", [
+                'machine_id' => $machineId,
+                'event' => $event,
+            ]);
+        }
+    }
+}
