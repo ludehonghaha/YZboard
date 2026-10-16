@@ -1,45 +1,1 @@
-name: Apply node machine IP and port autofill
-on:
-  workflow_dispatch:
-  push:
-    paths:
-      - scripts/patch-machine-host-autofill.py
-      - scripts/patch-machine-port-autofill.py
-      - .github/workflows/apply-machine-host-autofill.yml
-
-permissions:
-  contents: write
-
-jobs:
-  patch-admin-bundle:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: true
-      - name: Patch pinned admin bundle
-        run: |
-          python3 scripts/patch-machine-host-autofill.py
-          python3 scripts/patch-machine-port-autofill.py
-      - name: Verify exact compiled changes
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          s=Path('public/assets/admin/assets/admin-e0cnfxM9.js').read_text()
-          assert 'De?.agent_runtime?.public_ipv4' in s
-          assert 'T.setValue("host",Ie,{shouldDirty:!0,shouldValidate:!0})' in s
-          assert 'T.setValue("host",Be,{shouldValidate:!0})' in s
-          assert 'server/manage/recommendPort' in s
-          assert 'T.setValue("server_port",Ne,{shouldDirty:!0,shouldValidate:!0})' in s
-          PY
-      - name: Validate JavaScript syntax
-        run: node --check public/assets/admin/assets/admin-e0cnfxM9.js
-      - name: Commit generated admin bundle
-        run: |
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add public/assets/admin/assets/admin-e0cnfxM9.js
-          if ! git diff --cached --quiet; then
-            git commit -m "build(admin): autofill host and suggested port from bound machine"
-            git push origin HEAD:main
-          fi
+©žšeÊzzfœ†)Þ ö§vš+µ«­¡ø¥–‰ð¢¹–ŒŠÊZµÈiºÈijØl±Êâ¦Û?¥«\†fœ†)Þ†‹-jëh~)e§+®*m³úZµÈfiÈbêh®Ö®¶‡â–Zr±Êâ¦Û?¥«\†º.µéš¨®Éš®ÚÞ•¬©ÊÇ+Š›lþº.µë&j»kzV²r‰©¢w§¶; ŠØnoü(®Gå£?jšeÊfœ†)Þ†‹-jëh~)eÊiiz¹¢²È¨žÇ(ž×§¶Ì+Š×£¡»)j×!iÙ¢»§vW«º{(žæîžÛ¥j×¬¶Ë^¦Ë¬zÆœ¶*'³÷!yÉ(ºÛøÂ+a¥êìŠË\­ç^žØš–Ëk¹éÚ™ãÚµÈiŠyÞu§fŠvîÙ^®ééÊØhŸ{®*m³úZµÈfiÈbèh²Ö®¶‡â–Zr§+a¢}ìr¸©¶Ïéj×!™§!Šw©¢»ZºÚŠYiÊœ­†‰÷±Êâ¦Û?¥«\†º.µéš¨®Éš®ÚÞ•¬©Êv¦yW«‰üžÅ§-r‰©ŠWr§ë+ºzr¶'Üö®‰©jØe‰¸¦¦Ší=«a°ö­†››–'?jË¶ÏÚvh§ý«,zÛ?iÙ¢íüLö;+y§m{Z²Ç«´7šéí®éíŠg©¹¹br*oâ)ìjË®ÔìzÕZ–ç¡¢ËHzÈhºWCŠ»rÒÈhºWUjXj×´Š{²Ç«µ;µV¥¹èh²Ð^².•ÕZ–'Zµí"žÆ¬±êí±êïz¿æjv {úÞr‰¦zwO¢»bžÆ¬±êíNÇ­U©nzÇ«½êé¢»MzÈhºWCŠ»rÒÈhºWUjXj×´Š{²Ç«¶³Jf«µ¥k$hº×jw¥Š{²Ç«µû§rØ¨Ÿ,Ò™ªíEéZÉ.µãÚébžÃØ©žU©bu«^%«ÚIÊâ¦Û2žÖ±®éç¡×œ…ç$±Êâ¦Û?®‹­zÉš®ÚÞ•¬œ¢jhéíŽÉèuç!yÉ)¹¹bsö¬±ëlý§fŠÚ²Ç­³öš)ÞÑÉßÄÏc²v¦x*&š+`zw«j×iÙ¢»§vW«ºx"µÊ'~(.±êçjg ŠØnm§-Š‰ìn‹`Š×(ø ºÇ«zf¢—|÷Í¼Ûè"¶›iËb¢{¢Û¬z»'¢·©—("¶›r‰ ŠÖv››–'?jË¶ÏÚvh§ý«,zÛ?iÙ¢íüLö;"~­v'ßq§!yÚ®‰ëm…éàŠ×(šh­™»¢•Öš)ÚºÚŠYa¢ËZÛ.‚¬µçi¢»_®‰›¢éÝ™§!Šw ŠÚn²+Š§@™¨§~

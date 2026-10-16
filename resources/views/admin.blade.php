@@ -93,11 +93,6 @@
 </head>
 
 <body>
-  <a href="/{{ $secure_path }}/smart-relay"
-   title="智能落地分流设置"
-   style="position:fixed;right:16px;bottom:18px;z-index:35;display:inline-flex;align-items:center;gap:6px;
-     padding:9px 13px;background:#1b293d;color:#d7e8ff;text-decoration:none;border:1px solid #3a526f;
-     box-shadow:0 4px 12px #0004;border-radius:999px;font:13px system-ui,sans-serif">智能分流 ↗</a>
   <div id="root"></div>
 </body>
 
