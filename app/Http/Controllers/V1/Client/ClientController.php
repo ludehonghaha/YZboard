@@ -90,7 +90,7 @@ class ClientController extends Controller
 
         $remark = (string) admin_setting('app_name', 'YZboard');
         $encodedShadowUrl = rtrim(strtr(base64_encode($shadowUrl), '+/', '-_'), '=');
-        $shadowrocketLink = 'shadowrocket://add/sub/' . $encodedShadowUrl . '?remark=' . rawurlencode($remark);
+        $shadowrocketLink = 'shadowrocket://add/sub://' . $encodedShadowUrl . '?remark=' . rawurlencode($remark);
         $clashLink = 'clash://install-config?url=' . rawurlencode($mihomoUrl);
 
         $writer = new Writer(new ImageRenderer(
