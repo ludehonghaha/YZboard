@@ -1,0 +1,35 @@
+name: Import pinned YZboard upstream
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/import-upstream.yml
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Fetch vetted upstream baseline
+        run: |
+          git clone --no-checkout https://github.com/P0me1oo/YZboard.git /tmp/yzboard-upstream
+          git -C /tmp/yzboard-upstream checkout --detach 8d78f1e4157caee0862709f84b1a2b8e88d30982
+      - name: Import application source without upstream CI workflows
+        run: |
+          rsync -a --delete --exclude='/.git/' --exclude='/.github/workflows/' /tmp/yzboard-upstream/ ./
+          printf '\nOriginal project: https://github.com/P0me1oo/YZboard\n' >> .upstream-source
+          printf 'Pinned upstream commit: 8d78f1e4157caee0862709f84b1a2b8e88d30982\n' >> .upstream-source
+      - name: Commit imported source
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: import pinned YZboard upstream source"
+            git push origin HEAD:main
+          fi
