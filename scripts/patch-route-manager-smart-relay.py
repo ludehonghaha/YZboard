@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Idempotently insert native smart-relay UI into pinned YZboard route page."""
+"""Maintain chain routing UI into pinned YZboard route page."""
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]
 path=root/'public/assets/admin/assets/admin-e0cnfxM9.js'
