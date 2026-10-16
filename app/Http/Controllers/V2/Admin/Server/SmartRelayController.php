@@ -5,39 +5,34 @@ namespace App\Http\Controllers\V2\Admin\Server;
 use App\Http\Controllers\Controller;
 use App\Models\Server;
 use App\Services\ServerRelayService;
+use App\Services\SmartRoutingService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
 
-/**
- * Automatic landing for the *entry identity only*. Explicit logical-node
- * subscriptions retain their original manual route selection.
- *
- * The admin middleware protects both endpoints and triggers NodeSyncService
- * through ServerObserver. No GEN2 hardware / remote node is changed here.
- */
 class SmartRelayController extends Controller
 {
     public function fetch()
     {
-        $entries = Server::orderBy('sort')->get()
-            ->filter(fn (Server $node) => ServerRelayService::isSupportedEntry($node))
-            ->map(function (Server $entry) {
-                $children = ServerRelayService::childrenOf($entry)
-                    ->map(fn (Server $child) => [
-                        'id' => (int) $child->id,
-                        'name' => $child->name,
-                        'type' => $child->type,
-                    ])->values()->all();
-                return [
-                    'id' => (int) $entry->id,
-                    'name' => $entry->name,
-                    'children' => $children,
-                    'smart_relay' => $entry->smart_relay,
-                ];
-            })->values()->all();
+        $entries = SmartRoutingService::validEntries()->map(function (Server $entry) {
+            $children = ServerRelayService::isSupportedEntry($entry)
+                ? ServerRelayService::childrenOf($entry)->map(fn (Server $child) => [
+                    'id' => (int) $child->id,
+                    'name' => $child->name,
+                    'type' => $child->type,
+                ])->values()->all()
+                : [];
+            return [
+                'id' => (int) $entry->id,
+                'name' => $entry->name,
+                'protocol' => $entry->type,
+                'kernel' => Server::effectiveKernelType($entry->kernel_type),
+                'children' => $children,
+                'smart_relay' => $entry->smart_relay,
+            ];
+        })->values()->all();
 
-        return $this->success(['entries' => $entries]);
+        return $this->success(['entries' => $entries, 'protocols' => SmartRoutingService::PROTOCOLS]);
     }
 
     public function save(Request $request)
@@ -45,53 +40,46 @@ class SmartRelayController extends Controller
         $input = $request->validate([
             'entry_id' => 'required|integer|min:1',
             'enabled' => 'required|boolean',
-            'ai_node_id' => 'required_if:enabled,true|nullable|integer|min:1',
-            'default_node_id' => 'required_if:enabled,true|nullable|integer|min:1',
-            'domains' => 'required_if:enabled,true|array|max:64',
-            'domains.*' => [
-                'string',
-                'max:253',
-                'regex:/^(?:\\*\\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i',
+            'default_target' => 'required_if:enabled,true|nullable|string|max:80',
+            'outbounds' => 'array|max:12',
+            'outbounds.*.id' => 'required|string|regex:/^[a-z0-9]{4,16}$/|distinct',
+            'outbounds.*.name' => 'required|string|max:64',
+            'outbounds.*.protocol' => 'required|string|in:'.implode(',', SmartRoutingService::PROTOCOLS),
+            'outbounds.*.server' => [
+                'required', 'string', 'max:253',
+                'regex:/^(?:[a-z0-9][a-z0-9.-]{0,251}|[a-f0-9:]+)$/i',
             ],
+            'outbounds.*.port' => 'required|integer|min:1|max:65535',
+            'outbounds.*.username' => 'nullable|string|max:256',
+            'outbounds.*.password' => 'nullable|string|max:512',
+            'outbounds.*.uuid' => 'nullable|string|max:64',
+            'outbounds.*.method' => 'nullable|string|max:80',
+            'outbounds.*.sni' => 'nullable|string|max:253',
+            'outbounds.*.tls' => 'nullable|boolean',
+            'outbounds.*.transport' => 'nullable|in:TCP,UDP',
+            'rules' => 'array|max:32',
+            'rules.*.name' => 'required|string|max:64',
+            'rules.*.kind' => 'required|in:domain_suffix,ip_cidr',
+            'rules.*.values' => 'required|array|min:1|max:64',
+            'rules.*.values.*' => 'required|string|max:253',
+            'rules.*.target' => 'required|string|max:80',
         ]);
-
-        $enabled = (bool) $input['enabled'];
-        $domains = collect($input['domains'] ?? [])
-            ->map(fn ($domain) => strtolower(ltrim(trim($domain), '*.')))
-            ->unique()->values()->all();
-        if ($enabled && $domains === []) {
-            throw ValidationException::withMessages(['domains' => '请至少填写一个 AI 域名']);
-        }
-
-        DB::transaction(function () use ($input, $enabled, $domains) {
+        DB::transaction(function () use ($input) {
             $entry = Server::whereKey($input['entry_id'])->lockForUpdate()->first();
-            if (!$entry || !ServerRelayService::isSupportedEntry($entry)) {
-                throw ValidationException::withMessages(['entry_id' => '入口不存在，或不是可用的 VLESS/HY2 中转入口']);
+            if (!$entry) {
+                throw ValidationException::withMessages(['entry_id' => '入口节点不存在']);
             }
-
-            $ai = (int) ($input['ai_node_id'] ?? 0);
-            $fallback = (int) ($input['default_node_id'] ?? 0);
-            if ($enabled) {
-                $childIds = ServerRelayService::childrenOf($entry)
-                    ->pluck('id')->map(fn ($id) => (int) $id)->all();
-                if ($ai === $fallback
-                    || !in_array($ai, $childIds, true)
-                    || !in_array($fallback, $childIds, true)) {
-                    throw ValidationException::withMessages([
-                        'ai_node_id' => 'AI 和默认落地必须不同，且都属于该入口的已启用落地节点',
-                    ]);
-                }
+            if (!$input['enabled']) {
+                $entry->smart_relay = array_merge(
+                    ['mode' => 'advanced'],
+                    (array) ($entry->smart_relay ?? []),
+                    ['enabled' => false]
+                );
+            } else {
+                $entry->smart_relay = SmartRoutingService::validateAndNormalize($entry, $input);
             }
-
-            $entry->smart_relay = $enabled ? [
-                'enabled' => true,
-                'ai_node_id' => $ai,
-                'default_node_id' => $fallback,
-                'domains' => $domains,
-            ] : ['enabled' => false];
             $entry->save();
         }, 3);
-
         return $this->success(true);
     }
 }

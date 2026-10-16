@@ -730,9 +730,20 @@ class ServerService
         if ($relay = self::buildRelayConfig($node)) {
             $response['relay'] = $relay;
         }
-        // Smart relay is only meaningful on a valid entry with both active child outbounds.
-        // The Node independently validates IDs against the relay children before applying rules.
-        if (($response['relay']['mode'] ?? null) === 'entry'
+        // Smart routing v2: each inbound can have custom proxy landings and
+        // ordered rules. Existing relay entry mode remains backwards compatible.
+        $smart = (array) ($node->smart_relay ?? []);
+        if (($smart['mode'] ?? null) === 'advanced'
+            && ($smart['enabled'] ?? false) === true
+            && Server::effectiveKernelType($node->kernel_type) === Server::KERNEL_SINGBOX
+            && !$node->isRelayChild()) {
+            $response['smart_relay'] = [
+                'mode' => 'advanced',
+                'enabled' => true,
+                'rules' => $smart['rules'] ?? [],
+                'default_target' => $smart['default_target'] ?? 'direct',
+            ];
+        } elseif (($response['relay']['mode'] ?? null) === 'entry'
             && data_get($node->smart_relay, 'enabled') === true) {
             $config = $node->smart_relay;
             $ids = array_column($response['relay']['children'], 'node_id');
@@ -759,6 +770,12 @@ class ServerService
 
         if (!empty($node['custom_outbounds'])) {
             $response['custom_outbounds'] = $node['custom_outbounds'];
+        }
+        if (($response['smart_relay']['mode'] ?? null) === 'advanced') {
+            $response['custom_outbounds'] = array_merge(
+                $response['custom_outbounds'] ?? [],
+                SmartRoutingService::outboundConfigs($smart)
+            );
         }
 
         if (!empty($node['custom_routes'])) {

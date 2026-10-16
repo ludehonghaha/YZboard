@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Maintain chain routing UI into pinned YZboard route page."""
+"""Idempotently insert native smart-relay UI into pinned YZboard route page."""
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]
 path=root/'public/assets/admin/assets/admin-e0cnfxM9.js'
@@ -12,7 +12,13 @@ if 'function yzSmartRelayRoutePanel()' not in src:
     assert src.count(anchor)==1,"Route module anchor changed"
     src=src.replace(anchor,component+'\n'+anchor,1)
     print('Embedded route form component')
-else:print('Already embedded')
+else:
+    start=src.index('function yzSmartRelayRoutePanel()')
+    end=src.index(anchor,start)
+    if src[start:end].rstrip()!=component.rstrip():
+        src=src[:start]+component+'\n'+src[end:]
+        print('Updated route UI')
+    else:print('Already embedded')
 if widget not in src:
     assert src.count(table)==1,"Route table anchor changed"
     src=src.replace(table,widget+table,1)
