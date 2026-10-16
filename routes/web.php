@@ -95,6 +95,12 @@ Route::get('/' . admin_setting('secure_path', admin_setting('frontend_admin_path
     ]);
 });
 
+// Public-by-token import landing page (same authority as the subscription URL).
+Route::get('/' . (admin_setting('subscribe_path', 's')) . '/{token}/import',
+    [\App\Http\Controllers\V1\Client\ClientController::class, 'importPage'])
+    ->middleware('client')
+    ->name('client.import');
+
 Route::get('/' . (admin_setting('subscribe_path', 's')) . '/{token}', [\App\Http\Controllers\V1\Client\ClientController::class, 'subscribe'])
     ->middleware('client')
     ->name('client.subscribe');
