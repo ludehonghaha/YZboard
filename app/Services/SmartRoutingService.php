@@ -14,6 +14,49 @@ use Illuminate\Validation\ValidationException;
 class SmartRoutingService
 {
     public const PROTOCOLS = ['socks', 'http', 'shadowsocks', 'vless', 'trojan', 'hysteria2', 'mieru'];
+    // Existing panel nodes currently supported as reusable outbounds.
+    // SOCKS and Mieru share credential semantics with the normal panel users.
+    public const REUSABLE = [Server::TYPE_SOCKS, Server::TYPE_MIERU];
+
+    public static function reusableLandings(Server $entry): array
+    {
+        $entryUserIds = self::userIdsForNode($entry);
+        if ($entryUserIds === []) return [];
+
+        return Server::query()->where('enabled', true)->orderBy('sort')->get()
+            ->filter(function (Server $other) use ($entry, $entryUserIds) {
+                if ((int) $other->id === (int) $entry->id
+                    || !$other->machine_id
+                    || $other->isRelayChild()
+                    || !in_array($other->type, self::REUSABLE, true)
+                    || data_get($other->smart_relay, 'enabled') === true
+                    || !preg_match('/^[1-9][0-9]{0,4}$/', (string) $other->port)) return false;
+                return array_intersect($entryUserIds, self::userIdsForNode($other)) !== [];
+            })->map(fn (Server $other) => [
+                'id' => (int) $other->id,
+                'name' => $other->name,
+                'type' => $other->type,
+                'host' => $other->host,
+                'port' => (int) $other->port,
+                'tag' => 'sr-node-'.$other->id,
+            ])->values()->all();
+    }
+
+    private static function userIdsForNode(Server $node): array
+    {
+        return ServerService::getAvailableUsers($node)->pluck('id')
+            ->map(fn ($id) => (int) $id)->all();
+    }
+
+    private static function connectionUser(Server $entry, Server $landing): ?\stdClass
+    {
+        $sourceIds = self::userIdsForNode($entry);
+        if ($sourceIds === []) return null;
+        return ServerService::getAvailableUsers($landing)->first(
+            fn ($user) => in_array((int) $user->id, $sourceIds, true)
+        );
+    }
+
     private const INBOUNDS = ['shadowsocks', 'vmess', 'vless', 'trojan', 'hysteria', 'tuic', 'anytls', 'socks', 'http', 'mieru'];
 
     public static function validEntries()
@@ -39,6 +82,10 @@ class SmartRoutingService
         $allowed = ['direct' => true];
         foreach ($children as $childId) {
             $allowed["relay-{$childId}"] = true;
+        }
+
+        foreach (self::reusableLandings($entry) as $landing) {
+            $allowed[$landing['tag']] = true;
         }
 
         $outbounds = [];
@@ -102,10 +149,17 @@ class SmartRoutingService
             }
         }
 
+        $selectedExisting = [];
+        foreach ([$input['default_target'], ...array_column($rules, 'target')] as $tag) {
+            if (preg_match('/^sr-node-([1-9][0-9]*)$/', (string) $tag, $m)) {
+                $selectedExisting[] = (int) $m[1];
+            }
+        }
         return [
             'mode' => 'advanced',
             'enabled' => true,
             'default_target' => $input['default_target'],
+            'existing_node_ids' => array_values(array_unique($selectedExisting)),
             'outbounds' => $outbounds,
             'rules' => $rules,
         ];
@@ -177,13 +231,51 @@ class SmartRoutingService
         return $settings;
     }
 
-    public static function outboundConfigs(array $settings): array
+    public static function outboundConfigs(array $settings, Server $entry): array
     {
-        return array_map(fn ($item) => [
+        $outbounds = array_map(fn ($item) => [
             'tag' => 'sr-'.$item['id'],
             'protocol' => $item['protocol'],
             'settings' => $item['settings'],
         ], $settings['outbounds'] ?? []);
+
+        // Reuse exactly the nodes referred to by rules/default. Resolve their
+        // live connection settings at sync time; never persist user credentials
+        // in the route profile or send them to admin list APIs.
+        foreach (array_unique(array_map('intval', $settings['existing_node_ids'] ?? [])) as $id) {
+            if ($id <= 0 || $id === (int) $entry->id) continue;
+            $tag = 'sr-node-'.$id;
+            $landing = Server::find($id);
+            $candidate = $landing && collect(self::reusableLandings($entry))
+                ->contains(fn ($row) => $row['id'] === $id);
+            $user = $candidate ? self::connectionUser($entry, $landing) : null;
+
+            // If a landing was removed, disabled, has no common account or
+            // points back into a chain, reject traffic instead of falling back
+            // to direct or creating an unauthenticated outbound.
+            if (!$landing || !$candidate || !$user) {
+                $outbounds[] = ['tag' => $tag, 'protocol' => 'block', 'settings' => []];
+                continue;
+            }
+            $settingsForLanding = [
+                'server' => (string) $landing->host,
+                'server_port' => (int) $landing->port,
+                'username' => (string) $user->uuid,
+                'password' => (string) $user->uuid,
+            ];
+            if ($landing->type === Server::TYPE_SOCKS) {
+                $settingsForLanding['version'] = '5';
+            } elseif ($landing->type === Server::TYPE_MIERU) {
+                $settingsForLanding['transport'] =
+                    data_get($landing->protocol_settings, 'transport', 'TCP');
+            }
+            $outbounds[] = [
+                'tag' => $tag,
+                'protocol' => $landing->type,
+                'settings' => $settingsForLanding,
+            ];
+        }
+        return $outbounds;
     }
 
     private static function validDomain(string $value): bool
