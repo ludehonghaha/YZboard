@@ -482,7 +482,7 @@ class Shadowrocket extends AbstractProtocol
             $query .= '&traffic-pattern=' . rawurlencode($pattern);
         }
 
-        return "mierus://{$identity}:{$identity}@{$host}?{$query}#{$name}\\r\\n";
+        return "mierus://{$identity}:{$identity}@{$host}?{$query}#{$name}\r\n";
     }
 
     public static function buildSocks($password, $server)
