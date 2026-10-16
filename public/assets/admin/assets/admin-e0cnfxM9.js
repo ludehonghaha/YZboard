@@ -164,6 +164,11 @@ ALIDNS_ACCESS_KEY_ID=xxxx`,value:i,onChange:m=>{const _=m.target.value;r(_),p.on
  * This is a React component integrated into the existing Route Management page.
  * All writes use the existing protected admin API and do not touch route groups.
  */
+/*
+ * Generalized inbound -> ordered rules -> multiple proxy landings.
+ * This is a React component integrated into the existing Route Management page.
+ * All writes use the existing protected admin API and do not touch route groups.
+ */
 function yzSmartRelayRoutePanel() {
   const h=C.createElement;
   const AI=[
@@ -201,6 +206,16 @@ function yzSmartRelayRoutePanel() {
   }));
   const outboundTargets=outbounds.map(x=>({id:"sr-"+x.id,name:x.name+"（"+x.protocol+"）"}));
   const targets=[{id:"direct",name:"服务器直连（direct）"},...existingTargets,...childTargets,...outboundTargets];
+  const stored=current?.smart_relay||{};
+  const savedTarget=(stored.enabled&&stored.mode==="advanced")?stored.default_target:"direct";
+  const describeTarget=tag=>{
+    if(!tag||tag==="direct")return "入口服务器直连（不会经过家宽落地）";
+    return targets.find(x=>x.id===tag)?.name||"未知或已删除的落地："+tag;
+  };
+  const savedEnabled=!!stored.enabled;
+  const savedRules=stored.mode==="advanced"?(stored.rules||[]):[];
+  const currentRouteText=savedRules.length?("已保存 "+savedRules.length+" 条分流规则；未命中时 → "):"未设置规则：全部流量 → ";
+  const actualAgentVersion=current?.runtime?.agent_version||"未知";
   const inputBase="h-9 w-full rounded-md border bg-background px-2 text-sm text-foreground";
   const thinButton="rounded-md border px-3 py-1.5 text-xs hover:bg-accent";
   const blank=(id,protocol)=>({id,name:"新落地",protocol,server:"",port:"",username:"",password:"",uuid:"",method:"aes-128-gcm",sni:"",tls:false,transport:"TCP"});
@@ -252,7 +267,8 @@ function yzSmartRelayRoutePanel() {
         id:newId(),name:"AI 网站",kind:"domain_suffix",
         text:profile.domains.join("\n"),target:"relay-"+profile.ai_node_id
       }]:[]);
-      setDefaultTarget(profile.default_node_id?"relay-"+profile.default_node_id:"direct");
+      setDefaultTarget(profile.default_node_id?"relay-"+profile.default_node_id:
+        (entry?.existing_landings?.length===1?entry.existing_landings[0].tag:"direct"));
     }
     setMessage("");
     setError(false);
@@ -310,12 +326,11 @@ function yzSmartRelayRoutePanel() {
     setSaving(true);setError(false);setMessage("正在保存配置…");
     try{
       await api("/save",{method:"POST",body:JSON.stringify(payload)});
-      setMessage("配置已保存；请部署兼容版本 YZ-Agent 后验证实际出口。");
       const data=await api("/fetch");
       const updated=Array.isArray(data?.entries)?data.entries:entries;
       setEntries(updated);
       loadProfile(entryId,updated);
-      setMessage("配置已保存。");
+      setMessage("面板配置已保存。Agent 是否支持及应用此规则尚未确认，请继续测试最终出口 IP。");
     }catch(e){setError(true);setMessage(e.message);}
     finally{setSaving(false);}
   }
@@ -325,6 +340,29 @@ function yzSmartRelayRoutePanel() {
       h("div",null,h("h3",{className:"text-sm font-semibold"},"链式分流 · 多落地路由"),
         h("p",{className:"mt-1 text-xs text-muted-foreground"},"直接选择节点管理里已有的入口和落地；按域名/IP 设置规则，其他流量走默认出口。")),
       h("button",{type:"button",className:thinButton,onClick:()=>setOpen(!open)},open?"收起设置":"配置链式分流")
+    ),
+    h("div",{className:"mt-3 rounded-lg border bg-muted/10 p-3","data-yz-route-topology":"true"},
+      h("h4",{className:"mb-2 text-sm font-semibold"},"当前数据库已保存的链路（不是出口测速结果）"),
+      current?h("div",{className:"flex flex-wrap items-center gap-2 text-sm"},
+        h("span",{className:"rounded-md border bg-background px-3 py-2 font-medium"},
+          "入口："+current.name+" · "+current.protocol.toUpperCase()+" · #"+current.id),
+        h("span",{className:"text-muted-foreground"},"→"),
+        h("span",{className:"rounded-md border bg-background px-3 py-2"},
+          savedEnabled?currentRouteText:"未启用分流 → "),
+        h("span",{className:"text-muted-foreground"},"→"),
+        h("span",{className:"rounded-md border bg-background px-3 py-2 font-medium"},
+          describeTarget(savedEnabled?savedTarget:"direct"))
+      ):h("p",{className:"text-xs text-muted-foreground"},"请选择入口以查看实际保存的路由"),
+      current&&h("div",{className:"mt-3 flex flex-wrap gap-x-6 gap-y-1 text-xs text-muted-foreground"},
+        h("span",null,"配置："+(savedEnabled?"已启用":"未启用")),
+        h("span",null,"Agent："+actualAgentVersion+" / "+(current.runtime?.agent_online?"已连接":"未连接")),
+        h("span",null,"入口内核："+(current.runtime?.kernel_running?"运行中":"未确认运行")),
+        h("span",null,"规则兼容性：尚未验证"),
+        h("span",null,"最终出口 IP：尚未测试")
+      ),
+      current&&savedEnabled&&savedTarget==="direct"&&h("p",{
+        className:"mt-2 text-xs font-medium text-destructive"
+      },"当前没有转发到家宽落地，默认 direct，所以网站看到沪港自身出口 IP 是正常的。请在下方选择家宽索隆并保存。")
     ),
     open&&h("div",{className:"mt-4 space-y-4 border-t pt-4"},
       h("div",{className:"grid grid-cols-1 gap-3 md:grid-cols-2"},
@@ -349,7 +387,12 @@ function yzSmartRelayRoutePanel() {
         ),
         existingTargets.length
           ?h("div",{className:"grid grid-cols-1 gap-2 md:grid-cols-2"},
-            ...existingTargets.map(x=>h("div",{key:x.id,className:"rounded-md border bg-muted/10 px-3 py-2 text-xs"},x.name)))
+            ...existingTargets.map(x=>h("div",{key:x.id,className:"flex flex-wrap items-center justify-between gap-2 rounded-md border bg-muted/10 px-3 py-2 text-xs"},
+              h("span",null,x.name),
+              h("button",{type:"button",onClick:()=>setDefaultTarget(x.id),
+                className:thinButton,disabled:defaultTarget===x.id},
+                defaultTarget===x.id?"当前已选择":"设为默认出口")
+            )))
           :h("p",{className:"text-xs text-muted-foreground"},
             "暂无可复用的 SOCKS5 / Mieru 节点；请确认落地节点已启用，并与入口存在共同有效用户。"),
         h("p",{className:"mt-2 text-xs text-muted-foreground"},
@@ -438,6 +481,10 @@ function yzSmartRelayRoutePanel() {
       h("div",{className:"rounded-lg border bg-muted/10 p-3"},
         label("未匹配任何规则 → 默认出口"),
         select(defaultTarget,setDefaultTarget,targets),
+        h("p",{className:"mt-2 text-xs font-medium"},
+          "准备保存的默认出口："+describeTarget(defaultTarget)),
+        defaultTarget!==savedTarget&&h("p",{className:"mt-1 text-xs text-muted-foreground"},
+          "这里已更改选择，但尚未保存到面板，请点击下方保存。"),
         h("p",{className:"mt-2 text-xs text-muted-foreground"},
           "留空规则时，全部走默认出口。域名规则依赖入口收到真实域名；目标只有 IP 时不会匹配域名。")
       ),
