@@ -22,6 +22,7 @@ class General extends AbstractProtocol
         Server::TYPE_SOCKS,
         Server::TYPE_TUIC,
         Server::TYPE_HTTP,
+        Server::TYPE_MIERU,
     ];
 
     protected $protocolRequirements = [
@@ -46,6 +47,7 @@ class General extends AbstractProtocol
                 Server::TYPE_SOCKS => self::buildSocks($item['password'], $item),
                 Server::TYPE_TUIC => self::buildTuic($item['password'], $item),
                 Server::TYPE_HTTP => self::buildHttp($item['password'], $item),
+                Server::TYPE_MIERU => Shadowrocket::buildMieru($item['password'], $item),
                 default => '',
             };
         }
