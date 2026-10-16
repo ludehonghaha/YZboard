@@ -1,1 +1,51 @@
-©šeÊzzfœ†)Ş ö§vš+µ«­¡ø¥–‰ğ¢¹–ŒŠÊZµÈiºÈijØl±Êâ¦Û?¥«\†fœ†)Ş†‹-jëh~)e§+®*m³úZµÈfiÈbêh®Ö®¶‡â–Zr±Êâ¦Û?¥«\†º.µéš¨®Éš®ÚŞ•¬©ÊÇ+Š›lşº.µë&j»kzV²r‰©¢w§¶; ŠØnoü(®Gå£?jšeÊfœ†)Ş†‹-jëh~)eÊiiz¹¢²È¨Ç(×§¶Ì+Š×£¡»)j×!iÙ¢»§vW«º{(æîÛ¥j×¬¶Ë^¦Ë¬zÆœ¶*'³÷!yÉ(ºÛøÂ+a¥êìŠË\­ç^Øš–Ëk¹éÚ™ãÚµÈiŠyŞu§fŠvîÙ^®ééÊØhŸ{®*m³úZµÈfiÈbèh²Ö®¶‡â–Zr§+a¢}ìr¸©¶Ïéj×!™§!Šw©¢»ZºÚŠYiÊœ­†‰÷±Êâ¦Û?¥«\†º.µéš¨®Éš®ÚŞ•¬©Êv¦yW«‰üÅ§-r‰©ŠWr§ë+ºzr¶'Üö®‰©jØe‰¸¦¦Ší=«a°ö­†››–'?jË¶ÏÚvh§ı«,zÛ?iÙ¢íüLö;+y§m{Z²Ç«´7šéí®éíŠg©¹¹br*oâ)ìjË®ÔìzÕZ–ç¡¢ËHzÈhºWCŠ»rÒÈhºWUjXj×´Š{²Ç«µ;µV¥¹èh²Ğ^².•ÕZ–'Zµí"Æ¬±êí±êïz¿æjv {úŞr‰¦zwO¢»bÆ¬±êíNÇ­U©nzÇ«½êé¢»MzÈhºWCŠ»rÒÈhºWUjXj×´Š{²Ç«¶³Jf«µ¥k$hº×jw¥Š{²Ç«µû§rØ¨Ÿ,Ò™ªíEéZÉ.µãÚébÃØ©U©bu«^%«ÚIÊâ¦Û2Ö±®éç¡×œ…ç$±Êâ¦Û?®‹­zÉš®ÚŞ•¬œ¢jhéíÉèuç!yÉ)¹¹bsö¬±ëlı§fŠÚ²Ç­³öš)ŞÑÉßÄÏc²v¦x*&š+`zw«j×iÙ¢»§vW«ºx"µÊ'~(.±êçjg ŠØnm§-Š‰ìn‹`Š×(ø ºÇ«zf¢—|÷Í¼Ûè"¶›iËb¢{¢Û¬z»'¢·©—("¶›r‰ ŠÖv››–'?jË¶ÏÚvh§ı«,zÛ?iÙ¢íüLö;"~­v'ßq§!yÚ®‰ëm…éàŠ×(šh­™»¢•Öš)ÚºÚŠYa¢ËZÛ.‚¬µçi¢»_®‰›¢éİ™§!Šw ŠÚn²+Š§@™¨§~
+name: Apply node UI autofill and smart routing
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - scripts/patch-machine-host-autofill.py
+      - scripts/patch-machine-port-autofill.py
+      - scripts/patch-route-manager-smart-relay.py
+      - scripts/route-smart-relay-component.js
+      - .github/workflows/apply-machine-host-autofill.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-admin-bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Patch pinned admin bundle
+        run: |
+          python3 scripts/patch-machine-host-autofill.py
+          python3 scripts/patch-machine-port-autofill.py
+          python3 scripts/patch-route-manager-smart-relay.py
+      - name: Verify expected features
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('public/assets/admin/assets/admin-e0cnfxM9.js').read_text()
+          assert 'De?.agent_runtime?.public_ipv4' in s
+          assert 'T.setValue("host",Ie,{shouldDirty:!0,shouldValidate:!0})' in s
+          assert 'server/manage/recommendPort' in s
+          assert 'T.setValue("server_port",Ne,{shouldDirty:!0,shouldValidate:!0})' in s
+          assert 'g(yzSmartRelayRoutePanel,{})' in s
+          assert 'function yzSmartRelayRoutePanel()' in s
+          PY
+      - name: Validate JavaScript syntax
+        run: |
+          node --check scripts/route-smart-relay-component.js
+          node --check public/assets/admin/assets/admin-e0cnfxM9.js
+      - name: Commit generated admin bundle
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public/assets/admin/assets/admin-e0cnfxM9.js
+          if ! git diff --cached --quiet; then
+            git commit -m "build(admin): integrate smart landing in route manager"
+            git push origin HEAD:main
+          fi
