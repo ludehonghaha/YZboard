@@ -102,6 +102,29 @@ class ManageController extends Controller
         }
     }
 
+    /** 仅为新节点推荐机器上尚未在面板分配的端口，不保证远端操作系统未监听。 */
+    public function recommendPort(Request $request)
+    {
+        $validated = $request->validate([
+            'machine_id' => 'required|integer|exists:v2_server_machine,id',
+        ]);
+        $machine = \App\Models\ServerMachine::findOrFail($validated['machine_id']);
+        if (!$machine->is_active) {
+            throw ValidationException::withMessages(['machine_id' => '绑定服务器已停用']);
+        }
+
+        $port = ServerPortService::recommendUnusedPort((int) $machine->id);
+        if ($port === null) {
+            return $this->fail([400, '该机器暂无可推荐的高位端口']);
+        }
+
+        return $this->success([
+            'port' => $port,
+            'verified_on_machine' => false,
+            'note' => '已避开面板已分配端口；操作系统监听端口需由该机器 Agent 进一步核验',
+        ]);
+    }
+
     /** 表单填写时检查内部端口，配置重叠只提供提醒，不阻止保存。 */
     public function checkPort(Request $request)
     {

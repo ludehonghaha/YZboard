@@ -24,7 +24,7 @@ for name, old, new in [
     ("machine selector", selector_old, selector_new),
     ("machine preset", reset_tail, preset_new),
 ]:
-    if source.count(new) == 1:
+    if source.count(new) == 1 or (name == "machine preset" and source.count("C.useEffect(()=>{if(!r||s||!y.length)return;") == 1):
         print(f"{name}: already patched")
         continue
     if source.count(old) != 1:

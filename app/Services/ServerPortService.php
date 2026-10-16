@@ -55,6 +55,38 @@ class ServerPortService
         return null;
     }
 
+    /**
+     * Recommend an unallocated high port on the specified machine.
+     *
+     * Does NOT claim the port is free on the remote OS: only YZ-Agent on that
+     * machine can inspect active system sockets (including UDP). Avoid every
+     * server_port already configured in this panel, regardless of transport,
+     * so later protocol changes will not silently create collisions.
+     */
+    public static function recommendUnusedPort(int $machineId): ?int
+    {
+        $taken = Server::where('machine_id', $machineId)
+            ->whereBetween('server_port', [22000, 60000])
+            ->pluck('server_port')
+            ->mapWithKeys(fn ($port) => [(int) $port => true])
+            ->all();
+
+        for ($attempt = 0; $attempt < 128; $attempt++) {
+            $candidate = random_int(22000, 60000);
+            if (!isset($taken[$candidate])) {
+                return $candidate;
+            }
+        }
+
+        // Deterministic fallback for heavily occupied ranges.
+        for ($candidate = 22000; $candidate <= 60000; $candidate++) {
+            if (!isset($taken[$candidate])) {
+                return $candidate;
+            }
+        }
+        return null;
+    }
+
     /** 从管理列表一次计算全部提醒，不逐节点查询数据库，也不受列表筛选或分页影响。 */
     public static function conflictMessages(Collection $servers): array
     {
