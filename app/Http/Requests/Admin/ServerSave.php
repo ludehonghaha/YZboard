@@ -142,7 +142,7 @@ class ServerSave extends FormRequest
         ],
         'mieru' => [
             'transport' => 'required|string|in:TCP,UDP',
-            'traffic_pattern' => 'string',
+            'traffic_pattern' => 'nullable|string',
         ],
         'anytls' => [
             'tls' => 'nullable|array',
